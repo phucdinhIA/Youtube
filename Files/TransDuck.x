@@ -17,6 +17,14 @@ static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, CGFloat 
     if (!isfinite(cueDuration) || cueDuration <= 0 || !isfinite(audio.duration)) return 1;
     return MIN(MAX(1, audio.duration / cueDuration), 2 / MAX(0.5, playbackRate));
 }
+static AVPlayer *TDPlayerInLayer(CALayer *layer) {
+    if ([layer isKindOfClass:AVPlayerLayer.class] && ((AVPlayerLayer *)layer).player) return ((AVPlayerLayer *)layer).player;
+    for (CALayer *child in layer.sublayers) {
+        AVPlayer *player = TDPlayerInLayer(child);
+        if (player) return player;
+    }
+    return nil;
+}
 static NSArray<NSDictionary *> *TDModels(void) {
     return @[
         @{ @"name": @"Google", @"id": @"google" },
@@ -61,6 +69,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) UIButton *domainButton;
 @property (nonatomic, strong) NSArray<NSDictionary *> *domains;
 @property (nonatomic, strong) UISlider *speechVolumeSlider;
+@property (nonatomic, strong) UISlider *originalVolumeSlider;
 @property (nonatomic, strong) UISwitch *speechSwitch;
 @property (nonatomic, strong) UISwitch *bilingualSwitch;
 @property (nonatomic, strong) UISwitch *captionSwitch;
@@ -78,6 +87,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)persistSettings;
 - (void)refreshActivity;
 - (void)speechVolumeChanged;
+- (void)originalVolumeChanged;
 @end
 
 @interface TDVoicePicker : UITableViewController <UISearchResultsUpdating>
@@ -134,6 +144,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) BOOL preparing;
 @property (nonatomic) BOOL resumeAfterPrepare;
 @property (nonatomic) float speechVolume;
+@property (nonatomic) float originalVolume;
+@property (nonatomic, weak) AVPlayer *volumePlayer;
+@property (nonatomic) float previousOriginalVolume;
+@property (nonatomic) BOOL loggedMissingOriginalPlayer;
 @property (nonatomic) NSUInteger translatedCount;
 @property (nonatomic) NSUInteger synthesizedCount;
 @property (nonatomic) NSUInteger translationInFlight;
@@ -147,7 +161,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
 - (void)checkSession:(void (^)(BOOL))completion;
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume resumeAfterPrepare:(BOOL)resumeAfterPrepare;
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal originalVolume:(float)originalVolume speechVolume:(float)speechVolume resumeAfterPrepare:(BOOL)resumeAfterPrepare;
 - (void)stop;
 - (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion;
 - (void)fetchCaptionsForVideo:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
@@ -156,6 +170,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)saveSubtitle:(NSString *)srt videoID:(NSString *)videoID completion:(void (^)(NSError *))completion;
 - (void)fetchDomains:(void (^)(NSArray<NSDictionary *> *))completion;
 - (void)attachCaptionToPlayerView;
+- (void)applyOriginalVolume;
 - (void)translateNext:(NSUInteger)generation;
 - (void)translatedRange:(NSRange)range generation:(NSUInteger)generation;
 - (NSRange)takeNearestRangeFrom:(NSMutableArray<NSValue *> *)ranges;
@@ -244,6 +259,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.timer = nil;
     [self.audioPlayer stop];
     self.audioPlayer = nil;
+    if (self.volumePlayer) self.volumePlayer.volume = self.previousOriginalVolume;
+    self.volumePlayer = nil;
     if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
     self.originalMuteCaptured = NO;
     self.mutedVideo = nil;
@@ -273,7 +290,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self stop];
     self.status = message;
 }
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume resumeAfterPrepare:(BOOL)resumeAfterPrepare {
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal originalVolume:(float)originalVolume speechVolume:(float)speechVolume resumeAfterPrepare:(BOOL)resumeAfterPrepare {
     self.resumeAfterPrepare = NO;
     [self stop];
     NSString *videoID = player.currentVideoID;
@@ -291,6 +308,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.domain = domain;
     self.speech = speech;
     self.speechVolume = MIN(1, MAX(0, speechVolume));
+    self.originalVolume = MIN(1, MAX(0, originalVolume));
+    self.loggedMissingOriginalPlayer = NO;
     self.bilingual = bilingual;
     self.showCaptions = showCaptions;
     self.subtitleSize = MIN(36, MAX(16, subtitleSize));
@@ -633,6 +652,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.captionLabel = label;
     [self attachCaptionToPlayerView];
     self.previousTime = -1;
+    [self applyOriginalVolume];
     if (self.speech && self.muteOriginal && self.player.activeVideo) {
         self.mutedVideo = self.player.activeVideo;
         self.originalMuted = self.mutedVideo.isMuted;
@@ -640,6 +660,24 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         [self.mutedVideo setMuted:YES];
     }
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.15 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+- (void)applyOriginalVolume {
+    if (!self.speech || !self.player.playerView) return;
+    AVPlayer *player = TDPlayerInLayer(self.player.playerView.layer);
+    if (!player) {
+        if (!self.loggedMissingOriginalPlayer) {
+            NSLog(@"[TransDuckAudio] original AVPlayer layer unavailable");
+            self.loggedMissingOriginalPlayer = YES;
+        }
+        return;
+    }
+    if (player != self.volumePlayer) {
+        if (self.volumePlayer) self.volumePlayer.volume = self.previousOriginalVolume;
+        self.volumePlayer = player;
+        self.previousOriginalVolume = player.volume;
+        NSLog(@"[TransDuckAudio] original AVPlayer found; separate volume enabled");
+    }
+    player.volume = self.muteOriginal ? 0 : self.originalVolume;
 }
 - (void)attachCaptionToPlayerView {
     UIView *view = self.player.playerView;
@@ -656,6 +694,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     YTPlayerViewController *player = self.player;
     if (!player || ![player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
     [self attachCaptionToPlayerView];
+    [self applyOriginalVolume];
     CGFloat time = player.currentVideoMediaTime;
     if (player.isPlayingAd || !isfinite(time) || time < 0) {
         self.captionLabel.hidden = YES;
@@ -1077,7 +1116,13 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [stack addArrangedSubview:[self sectionLabel:@"Lồng tiếng"]];
     self.muteSwitch = [UISwitch new]; self.muteSwitch.on = [defaults boolForKey:@"TDMuteOriginal"];
     [stack addArrangedSubview:[self row:@"Tắt tiếng video gốc" control:self.muteSwitch]];
-    [stack addArrangedSubview:[self label:@"Giữ tiếng gốc bật mặc định. Có thể tắt nếu chỉ muốn nghe giọng lồng tiếng."]];
+    self.originalVolumeSlider = [UISlider new];
+    self.originalVolumeSlider.minimumValue = 0;
+    self.originalVolumeSlider.maximumValue = 1;
+    self.originalVolumeSlider.value = [defaults objectForKey:@"TDOriginalVolume"] ? [defaults floatForKey:@"TDOriginalVolume"] : 0.35;
+    [stack addArrangedSubview:[self label:@"Âm lượng video gốc"]];
+    [stack addArrangedSubview:self.originalVolumeSlider];
+    [stack addArrangedSubview:[self label:@"Giữ tiếng gốc ở mức thấp để nghe rõ giọng lồng tiếng. Tắt tiếng gốc sẽ ưu tiên hơn thanh âm lượng này."]];
     self.speechVolumeSlider = [UISlider new];
     self.speechVolumeSlider.minimumValue = 0;
     self.speechVolumeSlider.maximumValue = 1;
@@ -1088,6 +1133,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
         [control addTarget:self action:@selector(persistSettings) forControlEvents:UIControlEventValueChanged];
     }
     [self.speechVolumeSlider addTarget:self action:@selector(speechVolumeChanged) forControlEvents:UIControlEventValueChanged];
+    [self.originalVolumeSlider addTarget:self action:@selector(originalVolumeChanged) forControlEvents:UIControlEventValueChanged];
     self.startButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.startButton setTitle:@"Dịch và phát" forState:UIControlStateNormal];
     self.startButton.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
@@ -1217,6 +1263,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [defaults setFloat:self.captionOpacitySlider.value forKey:@"TDCaptionOpacity"];
     [defaults setBool:self.originalFirstSwitch.on forKey:@"TDOriginalFirst"];
     [defaults setBool:self.muteSwitch.on forKey:@"TDMuteOriginal"];
+    [defaults setFloat:self.originalVolumeSlider.value forKey:@"TDOriginalVolume"];
     [defaults setFloat:self.speechVolumeSlider.value forKey:@"TDSpeechVolume"];
 }
 - (void)refreshActivity {
@@ -1230,6 +1277,12 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     TDManager *manager = [TDManager shared];
     manager.speechVolume = self.speechVolumeSlider.value;
     manager.audioPlayer.volume = manager.speechVolume;
+}
+- (void)originalVolumeChanged {
+    [self persistSettings];
+    TDManager *manager = [TDManager shared];
+    manager.originalVolume = self.originalVolumeSlider.value;
+    [manager applyOriginalVolume];
 }
 - (void)start {
     if (!self.player.currentVideoID.length) { self.statusLabel.text = @"Hãy mở video trước."; return; }
@@ -1252,7 +1305,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
             [self refreshActivity];
             return;
         }
-        [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language domain:domain speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on showCaptions:self.captionSwitch.on subtitleSize:self.subtitleSizeSlider.value translationRulesEnabled:self.rulesSwitch.on muteOriginal:self.muteSwitch.on speechVolume:self.speechVolumeSlider.value resumeAfterPrepare:shouldResume];
+        [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language domain:domain speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on showCaptions:self.captionSwitch.on subtitleSize:self.subtitleSizeSlider.value translationRulesEnabled:self.rulesSwitch.on muteOriginal:self.muteSwitch.on originalVolume:self.originalVolumeSlider.value speechVolume:self.speechVolumeSlider.value resumeAfterPrepare:shouldResume];
         [self refreshActivity];
     }];
 }

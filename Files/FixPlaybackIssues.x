@@ -1,5 +1,6 @@
 // Some are adapted from https://github.com/Mark02-2012/YTPlaybackFix
 #import "Headers.h"
+#import <os/log.h>
 
 /* Old method
 static BOOL isReloaded = NO;
@@ -26,7 +27,7 @@ static BOOL isReloaded = NO;
 
 %hook YTMainAppVideoPlayerOverlayViewController
 - (void)handleError:(NSError *)error {
-    if (error) NSLog(@"[TransDuckPlayback] domain=%@ code=%ld description=%@", error.domain, (long)error.code, error.localizedDescription);
+    if (error) os_log(OS_LOG_DEFAULT, "[TransDuckPlayback] domain=%{public}s code=%ld", error.domain.UTF8String, (long)error.code);
     if (IS_ENABLED(FixPlaybackIssues) && error && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"] && error.code == 14) {
         YTPlayerViewController *playerViewController = self.parentViewController;
         if (![playerViewController.UIDelegate isKindOfClass:%c(YTWatchController)]) return;

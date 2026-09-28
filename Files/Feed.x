@@ -1,4 +1,5 @@
 #import "Headers.h"
+#import <os/log.h>
 
 %hook YTInnerTubeCollectionViewController
 - (void)viewDidAppear:(BOOL)animated {
@@ -12,7 +13,13 @@
         Class collectionClass = NSClassFromString(@"ASCollectionView");
         if (collectionClass && [view isKindOfClass:collectionClass]) {
             UICollectionView *collection = (UICollectionView *)view;
-            NSLog(@"[TransDuckFeed] controller=%@ width=%.0f layout=%@ sections=%ld", NSStringFromClass(self.class), collection.bounds.size.width, NSStringFromClass(collection.collectionViewLayout.class), (long)[collection numberOfSections]);
+            NSMutableArray<NSString *> *frames = [NSMutableArray array];
+            for (UICollectionViewCell *cell in collection.visibleCells) {
+                if (frames.count >= 6) break;
+                [frames addObject:[NSString stringWithFormat:@"%.0f:%.0f", cell.frame.origin.x, cell.frame.size.width]];
+            }
+            NSString *visible = [frames componentsJoinedByString:@","];
+            os_log(OS_LOG_DEFAULT, "[TransDuckFeed] controller=%{public}s width=%.0f sizeClass=%ld layout=%{public}s sections=%ld visible=%{public}s", NSStringFromClass(self.class).UTF8String, collection.bounds.size.width, (long)collection.traitCollection.horizontalSizeClass, NSStringFromClass(collection.collectionViewLayout.class).UTF8String, (long)[collection numberOfSections], visible.UTF8String);
         }
         [views addObjectsFromArray:view.subviews];
     }
