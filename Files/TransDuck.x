@@ -129,6 +129,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) BOOL synthesisInFlight;
 @property (nonatomic) BOOL startedPlayback;
 @property (nonatomic, strong) NSMutableSet<NSString *> *downloads;
+@property (nonatomic, strong) NSMutableArray<NSValue *> *translationRanges;
+@property (nonatomic, strong) NSMutableArray<NSValue *> *speechRanges;
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
 - (void)checkSession:(void (^)(BOOL))completion;
@@ -139,6 +141,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)saveSubtitle:(NSString *)srt videoID:(NSString *)videoID completion:(void (^)(NSError *))completion;
 - (void)fetchDomains:(void (^)(NSArray<NSDictionary *> *))completion;
 - (void)attachCaptionToPlayerView;
+- (void)translateNext:(NSUInteger)generation;
+- (void)translatedRange:(NSRange)range generation:(NSUInteger)generation;
+- (NSRange)takeNearestRangeFrom:(NSMutableArray<NSValue *> *)ranges;
 @end
 
 @implementation TDManager
@@ -226,6 +231,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.captionLabel = nil;
     self.cues = nil;
     self.prefixMaxEnd = nil;
+    self.translationRanges = nil;
+    self.speechRanges = nil;
     [self.downloads removeAllObjects];
     self.activeIndex = -1;
     self.preparing = NO;
@@ -275,8 +282,14 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             [maxEnds addObject:@(latestEnd)];
         }
         self.prefixMaxEnd = maxEnds;
+        NSUInteger batchSize = [self.model isEqualToString:@"google"] ? 50 : 10;
+        self.translationRanges = [NSMutableArray array];
+        self.speechRanges = [NSMutableArray array];
+        for (NSUInteger offset = 0; offset < cues.count; offset += batchSize) {
+            [self.translationRanges addObject:[NSValue valueWithRange:NSMakeRange(offset, MIN(batchSize, cues.count - offset))]];
+        }
         self.status = [NSString stringWithFormat:@"Đang dịch %lu câu…", (unsigned long)cues.count];
-        [self translateFrom:0 generation:generation];
+        [self translateNext:generation];
     }];
 }
 - (void)fetchCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
@@ -353,15 +366,39 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         }];
     }];
 }
-- (void)translateFrom:(NSUInteger)offset generation:(NSUInteger)generation {
+- (NSRange)takeNearestRangeFrom:(NSMutableArray<NSValue *> *)ranges {
+    CGFloat time = self.player.currentVideoMediaTime;
+    if (!isfinite(time) || time < 0) time = 0;
+    NSInteger low = 0, high = (NSInteger)self.cues.count;
+    while (low < high) {
+        NSInteger middle = low + (high - low) / 2;
+        if ([self.cues[(NSUInteger)middle][@"start"] doubleValue] <= time) low = middle + 1;
+        else high = middle;
+    }
+    NSInteger target = MAX(0, low - 1);
+    NSUInteger best = 0;
+    NSInteger bestDistance = NSIntegerMax;
+    for (NSUInteger i = 0; i < ranges.count; i++) {
+        NSRange range = ranges[i].rangeValue;
+        NSInteger first = (NSInteger)range.location;
+        NSInteger last = (NSInteger)NSMaxRange(range) - 1;
+        NSInteger distance = target < first ? first - target : (target > last ? target - last : 0);
+        if (distance < bestDistance) { best = i; bestDistance = distance; }
+    }
+    NSRange selected = ranges[best].rangeValue;
+    [ranges removeObjectAtIndex:best];
+    return selected;
+}
+- (void)translateNext:(NSUInteger)generation {
     if (generation != self.generation) return;
     if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
-    if (offset >= self.cues.count) {
+    if (!self.translationRanges.count) {
         self.translationComplete = YES;
         [self finishIfReady];
         return;
     }
-    NSRange range = NSMakeRange(offset, MIN([self.model isEqualToString:@"google"] ? 50 : 10, self.cues.count - offset));
+    NSRange range = [self takeNearestRangeFrom:self.translationRanges];
+    NSUInteger offset = range.location;
     NSArray *batch = [self.cues subarrayWithRange:range];
     if ([self.model isEqualToString:@"google"]) {
         NSURLComponents *parts = [NSURLComponents componentsWithString:[TDBaseURL stringByAppendingString:@"/api/v2/translateAll"]];
@@ -377,7 +414,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
                 NSString *text = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"text"] : nil;
                 self.cues[offset + i][@"translated"] = text.length ? text : batch[i][@"text"];
             }
-            [self translatedThrough:NSMaxRange(range) generation:generation];
+            [self translatedRange:range generation:generation];
         }];
         return;
     }
@@ -394,17 +431,22 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             NSString *text = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"translateResult"] : nil;
             self.cues[offset + i][@"translated"] = text.length ? text : batch[i][@"text"];
         }
-        [self translatedThrough:NSMaxRange(range) generation:generation];
+        [self translatedRange:range generation:generation];
     }];
 }
-- (void)translatedThrough:(NSUInteger)offset generation:(NSUInteger)generation {
+- (void)translatedRange:(NSRange)range generation:(NSUInteger)generation {
     if (generation != self.generation) return;
     if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
-    self.translatedCount = offset;
+    self.translatedCount += range.length;
     if (!self.startedPlayback) { self.startedPlayback = YES; [self beginPlayback:generation]; }
-    if (self.speech) [self synthesizeAvailable:generation];
-    self.status = [NSString stringWithFormat:@"Đã dịch %lu/%lu câu · đang chuẩn bị giọng…", (unsigned long)offset, (unsigned long)self.cues.count];
-    [self translateFrom:offset generation:generation];
+    if (self.speech) {
+        for (NSUInteger offset = range.location; offset < NSMaxRange(range); offset += 10) {
+            [self.speechRanges addObject:[NSValue valueWithRange:NSMakeRange(offset, MIN(10, NSMaxRange(range) - offset))]];
+        }
+        [self synthesizeAvailable:generation];
+    }
+    self.status = [NSString stringWithFormat:@"Đã dịch %lu/%lu câu%@", (unsigned long)self.translatedCount, (unsigned long)self.cues.count, self.speech ? @" · đang chuẩn bị giọng…" : @""];
+    [self translateNext:generation];
 }
 - (void)finishIfReady {
     if (!self.translationComplete) return;
@@ -415,10 +457,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)synthesizeAvailable:(NSUInteger)generation {
     if (generation != self.generation || self.synthesisInFlight || !self.speech) return;
     if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
-    NSUInteger offset = self.synthesizedCount;
-    if (offset >= self.translatedCount) { [self finishIfReady]; return; }
+    if (!self.speechRanges.count) { [self finishIfReady]; return; }
     self.synthesisInFlight = YES;
-    NSRange range = NSMakeRange(offset, MIN(10, self.translatedCount - offset));
+    NSRange range = [self takeNearestRangeFrom:self.speechRanges];
+    NSUInteger offset = range.location;
     NSArray *batch = [self.cues subarrayWithRange:range];
     NSMutableArray *subtitles = [NSMutableArray array];
     for (NSDictionary *cue in batch) [subtitles addObject:@{@"index":cue[@"index"], @"text":cue[@"translated"], @"start":cue[@"start"], @"end":cue[@"end"]}];
@@ -429,6 +471,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.synthesisInFlight = NO;
         if (error || results.count != batch.count) {
             self.speech = NO;
+            [self.speechRanges removeAllObjects];
             if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
             self.originalMuteCaptured = NO;
             self.mutedVideo = nil;
@@ -446,7 +489,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSInteger current = 0;
         while (current + 1 < (NSInteger)self.cues.count && [self.cues[(NSUInteger)(current + 1)][@"start"] doubleValue] <= now) current++;
         [self prefetchNearIndex:current];
-        self.synthesizedCount = NSMaxRange(range);
+        self.synthesizedCount += range.length;
         [self synthesizeAvailable:generation];
     }];
 }
