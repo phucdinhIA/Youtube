@@ -67,6 +67,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) UILabel *stateLabel;
 @end
 
+@interface TDSubtitleEditor : UIViewController
+@property (nonatomic, weak) YTPlayerViewController *player;
+@property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, strong) UILabel *statusLabel;
+@end
+
 @interface TDManager : NSObject
 @property (nonatomic, weak) YTPlayerViewController *player;
 @property (nonatomic, strong) NSURLSession *session;
@@ -98,6 +104,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage speech:(BOOL)speech bilingual:(BOOL)bilingual muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume;
 - (void)stop;
 - (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion;
+- (void)fetchCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
+- (void)saveSubtitle:(NSString *)srt videoID:(NSString *)videoID completion:(void (^)(NSError *))completion;
 @end
 
 @implementation TDManager
@@ -220,21 +228,46 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }];
 }
 - (void)fetchCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
+    NSURLComponents *userParts = [NSURLComponents componentsWithString:[TDBaseURL stringByAppendingString:@"/api/v2/subtitle/getUserSubtitleList"]];
+    userParts.queryItems = @[[NSURLQueryItem queryItemWithName:@"videoId" value:videoID]];
+    NSString *userPath = [userParts.URL.absoluteString substringFromIndex:TDBaseURL.length];
+    [self request:userPath method:@"GET" body:nil completion:^(id json, __unused NSError *error) {
+        NSArray *saved = [json isKindOfClass:NSDictionary.class] ? json[@"subtitles"] : nil;
+        NSArray *parsed = [self parseCaptionItems:saved];
+        if (parsed.count) { completion(parsed, nil); return; }
+        [self fetchOriginalCaptionsForVideo:videoID completion:completion];
+    }];
+}
+- (void)fetchOriginalCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
     NSURLComponents *parts = [NSURLComponents componentsWithString:[TDBaseURL stringByAppendingString:@"/api/v2/subtitle/getYoutubeSubtitleList"]];
     parts.queryItems = @[[NSURLQueryItem queryItemWithName:@"videoId" value:videoID], [NSURLQueryItem queryItemWithName:@"version" value:@"1.0"]];
     NSString *path = [parts.URL.absoluteString substringFromIndex:TDBaseURL.length];
     [self request:path method:@"GET" body:nil completion:^(id json, NSError *error) {
         if (error || ![json isKindOfClass:NSArray.class]) { completion(nil, error ?: [NSError errorWithDomain:@"TransDuck" code:422 userInfo:@{NSLocalizedDescriptionKey:@"Không đọc được phụ đề."}]); return; }
-        NSMutableArray *cues = [NSMutableArray array];
-        for (NSDictionary *item in json) {
-            if (![item isKindOfClass:NSDictionary.class]) continue;
-            NSDictionary *timing = item[@"$"];
-            NSString *text = item[@"_"];
-            double start = [timing[@"start"] doubleValue], duration = [timing[@"dur"] doubleValue];
-            if (![text isKindOfClass:NSString.class] || !text.length || duration <= 0 || start < 0) continue;
-            [cues addObject:[@{@"index":@(cues.count), @"text":text, @"start":@(start), @"end":@(start + duration)} mutableCopy]];
-        }
-        completion(cues, nil);
+        completion([self parseCaptionItems:json], nil);
+    }];
+}
+- (NSArray<NSMutableDictionary *> *)parseCaptionItems:(NSArray *)items {
+    if (![items isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray *cues = [NSMutableArray array];
+    for (NSDictionary *item in items) {
+        if (![item isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *timing = item[@"$"];
+        NSString *text = item[@"_"];
+        double start = [timing[@"start"] doubleValue], duration = [timing[@"dur"] doubleValue];
+        if (![text isKindOfClass:NSString.class] || !text.length || duration <= 0 || start < 0) continue;
+        [cues addObject:[@{@"text":text, @"start":@(start), @"end":@(start + duration)} mutableCopy]];
+    }
+    [cues sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"start"] compare:b[@"start"]]; }];
+    for (NSUInteger i = 0; i < cues.count; i++) cues[i][@"index"] = @(i);
+    return cues;
+}
+- (void)saveSubtitle:(NSString *)srt videoID:(NSString *)videoID completion:(void (^)(NSError *))completion {
+    [self request:@"/api/v2/subtitle/saveUserSubtitle" method:@"POST" body:@{@"videoId":videoID, @"srt":srt} completion:^(id json, NSError *error) {
+        if (error) { completion(error); return; }
+        NSDictionary *payload = [json isKindOfClass:NSDictionary.class] ? json : nil;
+        if ([payload[@"success"] boolValue]) { completion(nil); return; }
+        completion([NSError errorWithDomain:@"TransDuck" code:422 userInfo:@{NSLocalizedDescriptionKey:payload[@"message"] ?: @"Không lưu được phụ đề."}]);
     }];
 }
 - (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion {
@@ -539,6 +572,89 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 @end
 
+static NSString *TDSRTTime(NSTimeInterval seconds) {
+    long long milliseconds = llround(MAX(0, seconds) * 1000);
+    return [NSString stringWithFormat:@"%02lld:%02lld:%02lld,%03lld", milliseconds / 3600000, (milliseconds / 60000) % 60, (milliseconds / 1000) % 60, milliseconds % 1000];
+}
+
+@implementation TDSubtitleEditor
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Chỉnh sửa phụ đề";
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Lưu" style:UIBarButtonItemStyleDone target:self action:@selector(save)];
+    self.textView = [UITextView new];
+    self.textView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.textView.font = [UIFont monospacedSystemFontOfSize:15 weight:UIFontWeightRegular];
+    self.textView.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.textView.text = @"Đang tải phụ đề…";
+    self.textView.editable = NO;
+    [self.view addSubview:self.textView];
+    self.statusLabel = [UILabel new];
+    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusLabel.textColor = UIColor.secondaryLabelColor;
+    self.statusLabel.numberOfLines = 0;
+    self.statusLabel.text = @"Sửa nội dung và mốc thời gian SRT, rồi lưu để dùng cho lần lồng tiếng kế tiếp.";
+    [self.view addSubview:self.statusLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:20],
+        [self.statusLabel.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-20],
+        [self.textView.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:12],
+        [self.textView.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:16],
+        [self.textView.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-16],
+        [self.textView.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor]
+    ]];
+    NSString *videoID = self.player.currentVideoID;
+    __weak typeof(self) weakSelf = self;
+    [[TDManager shared] fetchCaptionsForVideo:videoID completion:^(NSArray<NSDictionary *> *cues, NSError *error) {
+        if (!weakSelf || ![weakSelf.player.currentVideoID isEqualToString:videoID]) return;
+        if (error || !cues.count) { weakSelf.statusLabel.text = error.localizedDescription ?: @"Video chưa có phụ đề."; weakSelf.textView.text = @""; return; }
+        NSMutableArray *blocks = [NSMutableArray arrayWithCapacity:cues.count];
+        for (NSUInteger i = 0; i < cues.count; i++) {
+            NSDictionary *cue = cues[i];
+            [blocks addObject:[NSString stringWithFormat:@"%lu\n%@ --> %@\n%@", (unsigned long)i + 1, TDSRTTime([cue[@"start"] doubleValue]), TDSRTTime([cue[@"end"] doubleValue]), cue[@"text"]]];
+        }
+        weakSelf.textView.text = [blocks componentsJoinedByString:@"\n\n"];
+        weakSelf.textView.editable = YES;
+    }];
+}
+- (BOOL)validateSRT:(NSString *)srt {
+    NSArray *blocks = [[srt stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"] componentsSeparatedByString:@"\n\n"];
+    NSRegularExpression *timing = [NSRegularExpression regularExpressionWithPattern:@"^([0-9]{2,}):([0-5][0-9]):([0-5][0-9]),([0-9]{3}) --> ([0-9]{2,}):([0-5][0-9]):([0-5][0-9]),([0-9]{3})$" options:0 error:nil];
+    if (!blocks.count) return NO;
+    NSUInteger count = 0;
+    for (NSString *block in blocks) {
+        NSString *trimmed = [block stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!trimmed.length) continue;
+        NSArray *lines = [trimmed componentsSeparatedByString:@"\n"];
+        if (lines.count < 3 || [lines[0] integerValue] != (NSInteger)count + 1) return NO;
+        NSString *timeLine = [lines[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        NSTextCheckingResult *match = [timing firstMatchInString:timeLine options:0 range:NSMakeRange(0, timeLine.length)];
+        if (!match) return NO;
+        double values[8];
+        for (NSUInteger i = 0; i < 8; i++) values[i] = [[timeLine substringWithRange:[match rangeAtIndex:i + 1]] doubleValue];
+        double start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / 1000;
+        double end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / 1000;
+        if (end <= start || ![[[lines subarrayWithRange:NSMakeRange(2, lines.count - 2)] componentsJoinedByString:@"\n"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length) return NO;
+        count++;
+    }
+    return count > 0;
+}
+- (void)save {
+    if (!self.textView.editable) return;
+    NSString *srt = self.textView.text;
+    if (![self validateSRT:srt]) { self.statusLabel.text = @"SRT không hợp lệ: kiểm tra số thứ tự, thời gian và nội dung."; return; }
+    NSString *videoID = self.player.currentVideoID;
+    self.navigationItem.rightBarButtonItem.enabled = NO;
+    self.statusLabel.text = @"Đang lưu…";
+    [[TDManager shared] saveSubtitle:srt videoID:videoID completion:^(NSError *error) {
+        self.navigationItem.rightBarButtonItem.enabled = YES;
+        self.statusLabel.text = error.localizedDescription ?: @"Đã lưu. Bản phụ đề này sẽ dùng cho lần dịch và lồng tiếng tiếp theo.";
+    }];
+}
+@end
+
 @implementation TDPanel
 - (UIButton *)menuButton:(NSString *)title options:(NSArray<NSDictionary *> *)options action:(SEL)action {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -620,6 +736,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.summaryButton setTitle:@"Tóm tắt video" forState:UIControlStateNormal];
     [self.summaryButton addTarget:self action:@selector(showSummary) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:self.summaryButton];
+    UIButton *editSubtitles = [UIButton buttonWithType:UIButtonTypeSystem];
+    [editSubtitles setTitle:@"Chỉnh sửa phụ đề" forState:UIControlStateNormal];
+    [editSubtitles addTarget:self action:@selector(showSubtitleEditor) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:editSubtitles];
     UIButton *stop = [UIButton buttonWithType:UIButtonTypeSystem];
     [stop setTitle:@"Dừng TransDuck" forState:UIControlStateNormal];
     [stop addTarget:self action:@selector(stop) forControlEvents:UIControlEventTouchUpInside];
@@ -698,6 +818,11 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     panel.player = self.player;
     panel.targetLanguage = self.languageButton.accessibilityValue ?: @"vi-VN";
     [self.navigationController pushViewController:panel animated:YES];
+}
+- (void)showSubtitleEditor {
+    TDSubtitleEditor *editor = [TDSubtitleEditor new];
+    editor.player = self.player;
+    [self.navigationController pushViewController:editor animated:YES];
 }
 - (void)stop { [[TDManager shared] stop]; }
 @end
