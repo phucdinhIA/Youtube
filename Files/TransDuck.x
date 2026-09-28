@@ -750,7 +750,6 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
                 return;
             }
         }
-        if (self.activeIndex >= (NSInteger)offset && self.activeIndex < (NSInteger)NSMaxRange(range) && !self.audioPlayer) self.activeIndex = -1;
         CGFloat now = self.player.currentVideoMediaTime;
         NSInteger current = 0;
         while (current + 1 < (NSInteger)self.cues.count && [self.cues[(NSUInteger)(current + 1)][@"start"] doubleValue] <= now) current++;
@@ -901,39 +900,33 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }
     if (!advancing || player.playerState != 3) { [self.audioPlayer pause]; return; }
     if (self.audioPlayer && !self.audioPlayer.isPlaying && self.audioPlayer.currentTime >= self.audioPlayer.duration - 0.05) self.audioFinished = YES;
-    // A synthesized phrase can be longer than its caption interval. Let it
-    // finish, then play the next phrase instead of cutting off the last words.
-    if (self.audioPlayer && found != self.activeIndex && !jumped && !self.audioFinished) {
-        self.audioPlayer.rate = TDPlaybackRate(player) * TDSpeechStretch(self.audioPlayer, self.cues[(NSUInteger)self.activeIndex], TDPlaybackRate(player));
+    // Keep the current phrase until it ends. Never rewind a playing phrase:
+    // caption intervals can be much shorter than their synthesized audio.
+    if (self.audioPlayer && !self.audioFinished) {
+        NSDictionary *cue = self.cues[(NSUInteger)self.activeIndex];
+        CGFloat playbackRate = TDPlaybackRate(player);
+        CGFloat stretch = TDSpeechStretch(self.audioPlayer, cue, playbackRate);
+        self.audioPlayer.rate = stretch * playbackRate;
         if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
         return;
     }
-    if (found == self.activeIndex) {
-        if (found < 0) [self prefetchNearIndex:next];
-        if (self.audioPlayer && found >= 0 && !self.audioFinished) {
-            NSDictionary *cue = self.cues[(NSUInteger)found];
-            CGFloat playbackRate = TDPlaybackRate(player);
-            CGFloat stretch = TDSpeechStretch(self.audioPlayer, cue, playbackRate);
-            CGFloat offset = MAX(0, time - [cue[@"start"] doubleValue]) * stretch;
-            if (fabs(self.audioPlayer.currentTime - offset) > 0.4) self.audioPlayer.currentTime = MIN(offset, self.audioPlayer.duration);
-            self.audioPlayer.rate = stretch * playbackRate;
-            if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
-        }
+    // The active index is the last narrated cue. An earlier overlapping cue
+    // can become visible again, but its audio must not be started twice.
+    if (found <= self.activeIndex) {
+        [self prefetchNearIndex:found >= 0 ? found : next];
         return;
     }
     [self.audioPlayer stop];
     self.audioPlayer = nil;
     self.audioFinished = NO;
-    NSInteger audioTarget = found;
-    if (!jumped && self.activeIndex >= 0 && found > self.activeIndex + 1) audioTarget = self.activeIndex + 1;
-    self.activeIndex = audioTarget;
-    [self prefetchNearIndex:audioTarget >= 0 ? audioTarget : next];
-    if (audioTarget < 0 || !self.speech) return;
-    NSString *urlString = self.cues[(NSUInteger)audioTarget][@"audioURL"];
+    self.activeIndex = found;
+    [self prefetchNearIndex:found];
+    if (!self.speech) return;
+    NSString *urlString = self.cues[(NSUInteger)found][@"audioURL"];
     if (!urlString) return;
     NSData *cached = [self.audioCache objectForKey:urlString];
-    if (cached) { [self playData:cached index:audioTarget time:time]; return; }
-    [self loadAudioAtIndex:audioTarget];
+    if (cached) { [self playData:cached index:found time:time]; return; }
+    [self loadAudioAtIndex:found];
 }
 - (void)prefetchNearIndex:(NSInteger)index {
     if (!self.speech || !self.cues.count) return;
@@ -980,7 +973,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             if (now < [cue[@"start"] doubleValue]) return;
             CGFloat playbackRate = TDPlaybackRate(self.player);
             CGFloat stretch = TDSpeechStretch(audio, cue, playbackRate);
-            audio.currentTime = now >= [cue[@"end"] doubleValue] ? 0 : MIN(MAX(0, now - [cue[@"start"] doubleValue]) * stretch, audio.duration);
+            // Play complete speech even when decoding or a network response
+            // arrives after the caption begins. Seeking resets activeIndex.
+            audio.currentTime = 0;
             audio.rate = stretch * playbackRate;
             audio.volume = self.speechVolume;
             audio.delegate = self;

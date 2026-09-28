@@ -2,6 +2,29 @@
 #import <os/log.h>
 #import <objc/runtime.h>
 
+static void TDEnableResponsiveHomeGrid(void) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return;
+    SEL selector = @selector(mainAppCoreClientEnableIosResponsiveGridsHome);
+    unsigned classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+    for (unsigned i = 0; i < classCount; i++) {
+        unsigned methodCount = 0;
+        Method *methods = class_copyMethodList(classes[i], &methodCount);
+        for (unsigned j = 0; j < methodCount; j++) {
+            Method method = methods[j];
+            if (method_getName(method) != selector) continue;
+            IMP replacement = imp_implementationWithBlock(^BOOL(id receiver) {
+                (void)receiver;
+                return YES;
+            });
+            method_setImplementation(method, replacement);
+            os_log(OS_LOG_DEFAULT, "[TransDuckFeedGrid] enabled responsive home in %{public}s", class_getName(classes[i]));
+        }
+        free(methods);
+    }
+    free(classes);
+}
+
 static void TDInspectFeedCapabilities(void) {
     NSArray<NSString *> *names = @[@"reflowedFeedContent:withColumnCount:andReflowOptions:", @"iosDisableResponsiveGridsInPortraitOnHome", @"mainAppCoreClientEnableIosResponsiveGridsHome", @"forceUseCompactGridVideoLayoutOnIpad"];
     unsigned count = 0;
@@ -174,3 +197,8 @@ static void YouModFilterChannelButtons(_ASDisplayView *self, NSString *iden) {
     }
 }
 %end
+
+%ctor {
+    %init;
+    TDEnableResponsiveHomeGrid();
+}
