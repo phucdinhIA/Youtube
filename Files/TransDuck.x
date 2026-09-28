@@ -145,6 +145,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) UILabel *captionLabel;
+@property (nonatomic, strong) UIActivityIndicatorView *playerActivity;
 @property (nonatomic, copy) NSString *videoID;
 @property (nonatomic, copy) NSString *model;
 @property (nonatomic, copy) NSString *voice;
@@ -167,6 +168,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, weak) YTSingleVideoController *mutedVideo;
 @property (nonatomic) BOOL preparing;
 @property (nonatomic) BOOL resumeAfterPrepare;
+@property (nonatomic) BOOL bufferingSeek;
+@property (nonatomic) BOOL resumeAfterSeek;
+@property (nonatomic) NSInteger bufferedCueIndex;
 @property (nonatomic) float speechVolume;
 @property (nonatomic) float originalVolume;
 @property (nonatomic, weak) AVPlayer *volumePlayer;
@@ -199,6 +203,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)translatedRange:(NSRange)range generation:(NSUInteger)generation;
 - (NSRange)takeNearestRangeFrom:(NSMutableArray<NSValue *> *)ranges;
 - (void)releaseInitialBuffer;
+- (BOOL)cueReadyAtIndex:(NSInteger)index;
+- (void)showPlayerActivity:(BOOL)show;
+- (void)releaseSeekBufferIfReady;
 @end
 
 @implementation TDManager
@@ -283,6 +290,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.timer = nil;
     [self.audioPlayer stop];
     self.audioPlayer = nil;
+    [self.playerActivity stopAnimating];
+    [self.playerActivity removeFromSuperview];
+    self.playerActivity = nil;
+    self.bufferingSeek = NO;
+    self.resumeAfterSeek = NO;
+    self.bufferedCueIndex = -1;
     if (self.volumePlayer) self.volumePlayer.volume = self.previousOriginalVolume;
     self.volumePlayer = nil;
     if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
@@ -311,6 +324,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)fail:(NSString *)message generation:(NSUInteger)generation {
     if (generation != self.generation) return;
+    self.resumeAfterPrepare = NO;
+    self.resumeAfterSeek = NO;
     [self stop];
     self.status = message;
 }
@@ -340,6 +355,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.translationRulesEnabled = translationRulesEnabled;
     self.muteOriginal = muteOriginal;
     self.preparing = YES;
+    [self showPlayerActivity:YES];
     NSUInteger generation = self.generation;
     self.status = @"Đang tải phụ đề…";
     [self fetchCaptionsForVideo:videoID player:player completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
@@ -586,6 +602,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         [self synthesizeAvailable:generation];
     } else if (NSLocationInRange(self.initialCueIndex, range)) [self releaseInitialBuffer];
     self.status = [NSString stringWithFormat:@"Đã dịch %lu/%lu câu%@", (unsigned long)self.translatedCount, (unsigned long)self.cues.count, self.speech ? @" · đang chuẩn bị giọng…" : @""];
+    if (self.preparing) [self releaseInitialBuffer];
+    [self releaseSeekBufferIfReady];
     [self translateNext:generation];
 }
 - (void)finishIfReady {
@@ -603,10 +621,63 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)releaseInitialBuffer {
     if (!self.preparing) return;
+    CGFloat time = self.player.currentVideoMediaTime;
+    NSInteger index = (NSInteger)self.initialCueIndex;
+    if (isfinite(time) && time >= 0) {
+        NSInteger low = 0, high = (NSInteger)self.cues.count;
+        while (low < high) {
+            NSInteger middle = low + (high - low) / 2;
+            if ([self.cues[(NSUInteger)middle][@"start"] doubleValue] <= time) low = middle + 1;
+            else high = middle;
+        }
+        index = MAX(0, low - 1);
+    }
+    self.initialCueIndex = (NSUInteger)index;
+    if (![self cueReadyAtIndex:index]) {
+        [self prefetchNearIndex:index];
+        return;
+    }
     self.preparing = NO;
     BOOL resume = self.resumeAfterPrepare;
     self.resumeAfterPrepare = NO;
     self.status = @"Đoạn đầu đã sẵn sàng · đang chuẩn bị phần còn lại…";
+    [self showPlayerActivity:NO];
+    if (resume && [self.player.currentVideoID isEqualToString:self.videoID]) [self.player play];
+}
+- (BOOL)cueReadyAtIndex:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger)self.cues.count) return YES;
+    NSDictionary *cue = self.cues[(NSUInteger)index];
+    if (![cue[@"translated"] isKindOfClass:NSString.class]) return NO;
+    if (!self.speech) return YES;
+    NSString *url = cue[@"audioURL"];
+    return url.length && [self.audioCache objectForKey:url] != nil;
+}
+- (void)showPlayerActivity:(BOOL)show {
+    if (!show) { [self.playerActivity stopAnimating]; self.playerActivity.hidden = YES; return; }
+    UIView *view = self.player.playerView;
+    if (!view) return;
+    if (!self.playerActivity) {
+        self.playerActivity = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+        self.playerActivity.translatesAutoresizingMaskIntoConstraints = NO;
+        self.playerActivity.color = UIColor.whiteColor;
+        self.playerActivity.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+        self.playerActivity.layer.cornerRadius = 16;
+    }
+    if (self.playerActivity.superview != view) {
+        [self.playerActivity removeFromSuperview];
+        [view addSubview:self.playerActivity];
+        [NSLayoutConstraint activateConstraints:@[[self.playerActivity.centerXAnchor constraintEqualToAnchor:view.centerXAnchor], [self.playerActivity.centerYAnchor constraintEqualToAnchor:view.centerYAnchor], [self.playerActivity.widthAnchor constraintEqualToConstant:64], [self.playerActivity.heightAnchor constraintEqualToConstant:64]]];
+    }
+    self.playerActivity.hidden = NO;
+    [self.playerActivity startAnimating];
+}
+- (void)releaseSeekBufferIfReady {
+    if (!self.bufferingSeek || ![self cueReadyAtIndex:self.bufferedCueIndex]) return;
+    self.bufferingSeek = NO;
+    [self showPlayerActivity:NO];
+    BOOL resume = self.resumeAfterSeek;
+    self.resumeAfterSeek = NO;
+    self.previousTime = -1;
     if (resume && [self.player.currentVideoID isEqualToString:self.videoID]) [self.player play];
 }
 - (void)synthesizeAvailable:(NSUInteger)generation {
@@ -639,6 +710,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             id value = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"ttsUrl"] : nil;
             NSString *url = [value isKindOfClass:NSString.class] ? value : nil;
             if ([url hasPrefix:@"https://"] && ![url.lastPathComponent.lowercaseString containsString:@"empty_audio"]) self.cues[offset + i][@"audioURL"] = url;
+            else if ([self.cues[offset + i][@"translated"] length]) {
+                [self fail:@"Một câu TTS chưa tạo được giọng. Hãy thử lại." generation:generation];
+                return;
+            }
         }
         if (self.activeIndex >= (NSInteger)offset && self.activeIndex < (NSInteger)NSMaxRange(range) && !self.audioPlayer) self.activeIndex = -1;
         CGFloat now = self.player.currentVideoMediaTime;
@@ -653,6 +728,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
                 else [self loadAudioAtIndex:(NSInteger)self.initialCueIndex];
             } else [self releaseInitialBuffer];
         }
+        [self releaseSeekBufferIfReady];
         [self synthesizeAvailable:generation];
     }];
 }
@@ -728,6 +804,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.previousTime = -1;
         return;
     }
+    BOOL jumped = self.previousTime >= 0 && fabs(time - self.previousTime) > MAX(0.55, 0.4 * TDPlaybackRate(player));
     BOOL advancing = self.previousTime < 0 || fabs(time - self.previousTime) > 0.015;
     self.advancing = advancing;
     self.previousTime = time;
@@ -743,6 +820,29 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     for (NSInteger i = next - 1; i >= 0 && [self.prefixMaxEnd[(NSUInteger)i] doubleValue] > time; i--) {
         if ([self.cues[(NSUInteger)i][@"end"] doubleValue] > time) { found = i; break; }
     }
+    NSInteger target = found >= 0 ? found : (next < (NSInteger)self.cues.count && [self.cues[(NSUInteger)next][@"start"] doubleValue] - time < 2 ? next : -1);
+    if (self.preparing) {
+        if (target >= 0) self.initialCueIndex = (NSUInteger)target;
+        [self releaseInitialBuffer];
+        if (self.preparing) { [self showPlayerActivity:YES]; return; }
+    }
+    if (jumped && target >= 0 && ![self cueReadyAtIndex:target]) {
+        self.bufferingSeek = YES;
+        self.bufferedCueIndex = target;
+        self.resumeAfterSeek = player.playerState == 3;
+        if (self.resumeAfterSeek) [player pause];
+        [self.audioPlayer stop];
+        self.audioPlayer = nil;
+        self.activeIndex = -1;
+        [self prefetchNearIndex:target];
+        [self showPlayerActivity:YES];
+        self.status = @"Đang xử lý đoạn vừa tua…";
+    }
+    if (self.bufferingSeek) {
+        if (target >= 0 && target != self.bufferedCueIndex) self.bufferedCueIndex = target;
+        [self releaseSeekBufferIfReady];
+        if (self.bufferingSeek) { [self showPlayerActivity:YES]; return; }
+    }
     self.captionLabel.hidden = !self.showCaptions || found < 0;
     if (found >= 0) {
         NSDictionary *cue = self.cues[(NSUInteger)found];
@@ -752,6 +852,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if (![self.captionLabel.text isEqualToString:display]) self.captionLabel.text = display;
     }
     if (!advancing) { [self.audioPlayer pause]; return; }
+    // A synthesized phrase can be longer than its caption interval. Let it
+    // finish, then play the next phrase instead of cutting off the last words.
+    if (self.audioPlayer && found != self.activeIndex && !jumped && self.audioPlayer.currentTime < self.audioPlayer.duration - 0.05) {
+        self.audioPlayer.rate = TDPlaybackRate(player) * TDSpeechStretch(self.audioPlayer, self.cues[(NSUInteger)self.activeIndex], TDPlaybackRate(player));
+        if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
+        return;
+    }
     if (found == self.activeIndex) {
         if (found < 0) [self prefetchNearIndex:next];
         if (self.audioPlayer && found >= 0) {
@@ -767,14 +874,16 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }
     [self.audioPlayer stop];
     self.audioPlayer = nil;
-    self.activeIndex = found;
-    [self prefetchNearIndex:found >= 0 ? found : next];
-    if (found < 0 || !self.speech) return;
-    NSString *urlString = self.cues[(NSUInteger)found][@"audioURL"];
+    NSInteger audioTarget = found;
+    if (!jumped && self.activeIndex >= 0 && found > self.activeIndex + 1) audioTarget = self.activeIndex + 1;
+    self.activeIndex = audioTarget;
+    [self prefetchNearIndex:audioTarget >= 0 ? audioTarget : next];
+    if (audioTarget < 0 || !self.speech) return;
+    NSString *urlString = self.cues[(NSUInteger)audioTarget][@"audioURL"];
     if (!urlString) return;
     NSData *cached = [self.audioCache objectForKey:urlString];
-    if (cached) { [self playData:cached index:found time:time]; return; }
-    [self loadAudioAtIndex:found];
+    if (cached) { [self playData:cached index:audioTarget time:time]; return; }
+    [self loadAudioAtIndex:audioTarget];
 }
 - (void)prefetchNearIndex:(NSInteger)index {
     if (!self.speech || !self.cues.count) return;
@@ -796,11 +905,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             if (generation != self.generation) return;
             [self.downloads removeObject:urlString];
             if (error || ![http isKindOfClass:NSHTTPURLResponse.class] || http.statusCode != 200 || ![http.URL.scheme isEqualToString:@"https"] || data.length < 1000) {
-                if (self.preparing && index == (NSInteger)self.initialCueIndex) [self releaseInitialBuffer];
+                if ((self.preparing && index == (NSInteger)self.initialCueIndex) || (self.bufferingSeek && index == self.bufferedCueIndex)) [self fail:@"Không tải được giọng lồng tiếng cho đoạn đang chờ. Hãy thử lại." generation:generation];
                 return;
             }
             [self.audioCache setObject:data forKey:urlString cost:data.length];
             if (self.preparing && index == (NSInteger)self.initialCueIndex) [self releaseInitialBuffer];
+            if (self.bufferingSeek && index == self.bufferedCueIndex) [self releaseSeekBufferIfReady];
             if (self.activeIndex == index && self.player && !self.audioPlayer) [self playData:data index:index time:self.player.currentVideoMediaTime];
         });
     }] resume];
@@ -817,14 +927,15 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             if (generation != self.generation || self.activeIndex != index || !self.player) return;
             CGFloat now = self.player.currentVideoMediaTime;
             NSDictionary *cue = self.cues[(NSUInteger)index];
-            if (now < [cue[@"start"] doubleValue] || now >= [cue[@"end"] doubleValue]) return;
+            if (now < [cue[@"start"] doubleValue]) return;
             CGFloat playbackRate = TDPlaybackRate(self.player);
             CGFloat stretch = TDSpeechStretch(audio, cue, playbackRate);
-            audio.currentTime = MIN(MAX(0, now - [cue[@"start"] doubleValue]) * stretch, audio.duration);
+            audio.currentTime = now >= [cue[@"end"] doubleValue] ? 0 : MIN(MAX(0, now - [cue[@"start"] doubleValue]) * stretch, audio.duration);
             audio.rate = stretch * playbackRate;
             audio.volume = self.speechVolume;
             self.audioPlayer = audio;
-            if (self.advancing) [audio play];
+            BOOL started = self.advancing && [audio play];
+            os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], audio.volume, started);
         });
     });
 }
@@ -1303,6 +1414,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     TDManager *manager = [TDManager shared];
     manager.speechVolume = self.speechVolumeSlider.value;
     manager.audioPlayer.volume = manager.speechVolume;
+    os_log(OS_LOG_DEFAULT, "[TransDuckVoice] slider=%.2f active=%d", manager.speechVolume, manager.audioPlayer != nil);
 }
 - (void)originalVolumeChanged {
     [self persistSettings];
