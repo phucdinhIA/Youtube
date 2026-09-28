@@ -436,7 +436,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     CGFloat opacity = [defaults objectForKey:@"TDCaptionOpacity"] ? [defaults floatForKey:@"TDCaptionOpacity"] : 0.68;
     label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:MIN(0.9, MAX(0, opacity))];
     NSString *color = [defaults stringForKey:@"TDCaptionColor"] ?: @"white";
-    NSDictionary *colors = @{@"white":UIColor.whiteColor, @"yellow":UIColor.systemYellowColor, @"cyan":UIColor.systemCyanColor, @"green":UIColor.systemGreenColor};
+    NSDictionary *colors = @{@"white":UIColor.whiteColor, @"yellow":UIColor.systemYellowColor, @"cyan":UIColor.cyanColor, @"green":UIColor.systemGreenColor};
     label.textColor = colors[color] ?: UIColor.whiteColor;
     label.font = [UIFont systemFontOfSize:self.subtitleSize weight:UIFontWeightSemibold];
     label.textAlignment = NSTextAlignmentCenter;
