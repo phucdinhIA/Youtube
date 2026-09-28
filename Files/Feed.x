@@ -19,6 +19,18 @@ static void TDInspectFeedCapabilities(void) {
     free(classes);
 }
 
+@interface YTGridReflowController : NSObject
+- (id)reflowedFeedContent:(id)content withColumnCount:(NSInteger)columns andReflowOptions:(id)options;
+@end
+
+%hook YTGridReflowController
+- (id)reflowedFeedContent:(id)content withColumnCount:(NSInteger)columns andReflowOptions:(id)options {
+    NSInteger desired = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && columns == 1 ? 2 : columns;
+    if (desired != columns) os_log(OS_LOG_DEFAULT, "[TransDuckFeedGrid] reflow %ld to %ld columns", (long)columns, (long)desired);
+    return %orig(content, desired, options);
+}
+%end
+
 %hook YTInnerTubeCollectionViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;

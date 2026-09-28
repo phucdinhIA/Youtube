@@ -165,13 +165,14 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) UILabel *statusLabel;
 @end
 
-@interface TDManager : NSObject
+@interface TDManager : NSObject <AVAudioPlayerDelegate>
 @property (nonatomic, weak) YTPlayerViewController *player;
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *cues;
 @property (nonatomic, strong) NSArray<NSNumber *> *prefixMaxEnd;
 @property (nonatomic, strong) NSCache<NSString *, NSData *> *audioCache;
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
+@property (nonatomic) BOOL audioFinished;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) UILabel *captionLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *playerActivity;
@@ -321,6 +322,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.timer = nil;
     [self.audioPlayer stop];
     self.audioPlayer = nil;
+    self.audioFinished = NO;
     [self.playerActivity stopAnimating];
     [self.playerActivity removeFromSuperview];
     self.playerActivity = nil;
@@ -892,14 +894,14 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (!advancing) { [self.audioPlayer pause]; return; }
     // A synthesized phrase can be longer than its caption interval. Let it
     // finish, then play the next phrase instead of cutting off the last words.
-    if (self.audioPlayer && found != self.activeIndex && !jumped && self.audioPlayer.currentTime < self.audioPlayer.duration - 0.05) {
+    if (self.audioPlayer && found != self.activeIndex && !jumped && !self.audioFinished) {
         self.audioPlayer.rate = TDPlaybackRate(player) * TDSpeechStretch(self.audioPlayer, self.cues[(NSUInteger)self.activeIndex], TDPlaybackRate(player));
         if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
         return;
     }
     if (found == self.activeIndex) {
         if (found < 0) [self prefetchNearIndex:next];
-        if (self.audioPlayer && found >= 0) {
+        if (self.audioPlayer && found >= 0 && !self.audioFinished) {
             NSDictionary *cue = self.cues[(NSUInteger)found];
             CGFloat playbackRate = TDPlaybackRate(player);
             CGFloat stretch = TDSpeechStretch(self.audioPlayer, cue, playbackRate);
@@ -912,6 +914,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }
     [self.audioPlayer stop];
     self.audioPlayer = nil;
+    self.audioFinished = NO;
     NSInteger audioTarget = found;
     if (!jumped && self.activeIndex >= 0 && found > self.activeIndex + 1) audioTarget = self.activeIndex + 1;
     self.activeIndex = audioTarget;
@@ -971,11 +974,18 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             audio.currentTime = now >= [cue[@"end"] doubleValue] ? 0 : MIN(MAX(0, now - [cue[@"start"] doubleValue]) * stretch, audio.duration);
             audio.rate = stretch * playbackRate;
             audio.volume = self.speechVolume;
+            audio.delegate = self;
             self.audioPlayer = audio;
+            self.audioFinished = NO;
             BOOL started = self.advancing && [audio play];
             os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], audio.volume, started);
         });
     });
+}
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
+    if (player != self.audioPlayer) return;
+    self.audioFinished = YES;
+    os_log(OS_LOG_DEFAULT, "[TransDuckVoice] finished cue=%ld success=%d", (long)self.activeIndex, flag);
 }
 @end
 
