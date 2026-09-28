@@ -12,6 +12,11 @@ static CGFloat TDPlaybackRate(YTPlayerViewController *player) {
     CGFloat rate = [(YTMainAppVideoPlayerOverlayViewController *)overlay currentPlaybackRate];
     return isfinite(rate) && rate > 0 ? MIN(2, MAX(0.5, rate)) : 1;
 }
+static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, CGFloat playbackRate) {
+    CGFloat cueDuration = [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue];
+    if (!isfinite(cueDuration) || cueDuration <= 0 || !isfinite(audio.duration)) return 1;
+    return MIN(MAX(1, audio.duration / cueDuration), 2 / MAX(0.5, playbackRate));
+}
 static NSArray<NSDictionary *> *TDModels(void) {
     return @[
         @{ @"name": @"Google", @"id": @"google" },
@@ -541,6 +546,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)finishIfReady {
     if (!self.translationComplete) return;
     if (self.speech && (self.synthesisInFlight || self.synthesizedCount < self.cues.count)) return;
+    if (self.preparing && self.speech) {
+        NSString *url = self.cues[self.initialCueIndex][@"audioURL"];
+        if (url.length && ![self.audioCache objectForKey:url]) {
+            [self loadAudioAtIndex:(NSInteger)self.initialCueIndex];
+            return;
+        }
+    }
     [self releaseInitialBuffer];
     self.status = self.speech ? @"Phụ đề và lồng tiếng đã sẵn sàng." : @"Phụ đề đã sẵn sàng.";
 }
@@ -589,7 +601,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         while (current + 1 < (NSInteger)self.cues.count && [self.cues[(NSUInteger)(current + 1)][@"start"] doubleValue] <= now) current++;
         [self prefetchNearIndex:current];
         self.synthesizedCount += range.length;
-        if (NSLocationInRange(self.initialCueIndex, range)) [self releaseInitialBuffer];
+        if (NSLocationInRange(self.initialCueIndex, range)) {
+            NSString *initialURL = self.cues[self.initialCueIndex][@"audioURL"];
+            if (initialURL.length) {
+                if ([self.audioCache objectForKey:initialURL]) [self releaseInitialBuffer];
+                else [self loadAudioAtIndex:(NSInteger)self.initialCueIndex];
+            } else [self releaseInitialBuffer];
+        }
         [self synthesizeAvailable:generation];
     }];
 }
@@ -670,9 +688,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (found == self.activeIndex) {
         if (found < 0) [self prefetchNearIndex:next];
         if (self.audioPlayer && found >= 0) {
-            CGFloat offset = MAX(0, time - [self.cues[(NSUInteger)found][@"start"] doubleValue]);
+            NSDictionary *cue = self.cues[(NSUInteger)found];
+            CGFloat playbackRate = TDPlaybackRate(player);
+            CGFloat stretch = TDSpeechStretch(self.audioPlayer, cue, playbackRate);
+            CGFloat offset = MAX(0, time - [cue[@"start"] doubleValue]) * stretch;
             if (fabs(self.audioPlayer.currentTime - offset) > 0.4) self.audioPlayer.currentTime = MIN(offset, self.audioPlayer.duration);
-            self.audioPlayer.rate = TDPlaybackRate(player);
+            self.audioPlayer.rate = stretch * playbackRate;
             if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
         }
         return;
@@ -700,13 +721,19 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (![url.scheme isEqualToString:@"https"]) return;
     [self.downloads addObject:urlString];
     NSUInteger generation = self.generation;
-    [[self.session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.timeoutInterval = 12;
+    [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self.generation) return;
             [self.downloads removeObject:urlString];
-            if (error || ![http isKindOfClass:NSHTTPURLResponse.class] || http.statusCode != 200 || ![http.URL.scheme isEqualToString:@"https"] || data.length < 1000) return;
+            if (error || ![http isKindOfClass:NSHTTPURLResponse.class] || http.statusCode != 200 || ![http.URL.scheme isEqualToString:@"https"] || data.length < 1000) {
+                if (self.preparing && index == (NSInteger)self.initialCueIndex) [self releaseInitialBuffer];
+                return;
+            }
             [self.audioCache setObject:data forKey:urlString cost:data.length];
+            if (self.preparing && index == (NSInteger)self.initialCueIndex) [self releaseInitialBuffer];
             if (self.activeIndex == index && self.player && !self.audioPlayer) [self playData:data index:index time:self.player.currentVideoMediaTime];
         });
     }] resume];
@@ -724,8 +751,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             CGFloat now = self.player.currentVideoMediaTime;
             NSDictionary *cue = self.cues[(NSUInteger)index];
             if (now < [cue[@"start"] doubleValue] || now >= [cue[@"end"] doubleValue]) return;
-            audio.currentTime = MIN(MAX(0, now - [cue[@"start"] doubleValue]), audio.duration);
-            audio.rate = TDPlaybackRate(self.player);
+            CGFloat playbackRate = TDPlaybackRate(self.player);
+            CGFloat stretch = TDSpeechStretch(audio, cue, playbackRate);
+            audio.currentTime = MIN(MAX(0, now - [cue[@"start"] doubleValue]) * stretch, audio.duration);
+            audio.rate = stretch * playbackRate;
             audio.volume = self.speechVolume;
             self.audioPlayer = audio;
             if (self.advancing) [audio play];
