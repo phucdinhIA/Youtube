@@ -20,6 +20,17 @@
             }
             NSString *visible = [frames componentsJoinedByString:@","];
             os_log(OS_LOG_DEFAULT, "[TransDuckFeed] controller=%{public}s width=%.0f sizeClass=%ld layout=%{public}s sections=%ld visible=%{public}s", NSStringFromClass(self.class).UTF8String, collection.bounds.size.width, (long)collection.traitCollection.horizontalSizeClass, NSStringFromClass(collection.collectionViewLayout.class).UTF8String, (long)[collection numberOfSections], visible.UTF8String);
+            if ([self isKindOfClass:NSClassFromString(@"YTAppCollectionViewController")] && [collection numberOfSections] > 5) {
+                NSMutableArray<NSString *> *sections = [NSMutableArray array];
+                for (NSInteger section = 0; section < MIN(20, [collection numberOfSections]); section++) {
+                    NSInteger count = [collection numberOfItemsInSection:section];
+                    UICollectionViewLayoutAttributes *item = count ? [collection.collectionViewLayout layoutAttributesForItemAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:section]] : nil;
+                    CGRect frame = item.frame;
+                    [sections addObject:[NSString stringWithFormat:@"%ld/%ld=%.0f,%.0f,%.0f,%.0f", (long)section, (long)count, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]];
+                }
+                NSString *summary = [sections componentsJoinedByString:@";"];
+                os_log(OS_LOG_DEFAULT, "[TransDuckFeedSections] %{public}s", summary.UTF8String);
+            }
         }
         [views addObjectsFromArray:view.subviews];
     }

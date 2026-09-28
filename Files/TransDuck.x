@@ -1,5 +1,7 @@
 #import "Headers.h"
 #import <AVFoundation/AVFoundation.h>
+#import <objc/runtime.h>
+#import <os/log.h>
 #import "TransDuckVoices.h"
 
 extern void TDShowTranslationPreferences(UINavigationController *navigation, NSString *language, NSString *domain);
@@ -24,6 +26,28 @@ static AVPlayer *TDPlayerInLayer(CALayer *layer) {
         if (player) return player;
     }
     return nil;
+}
+static void TDLogPlayerObjects(id object, int depth, int *budget) {
+    if (!object || depth < 0 || *budget <= 0) return;
+    unsigned count = 0;
+    Ivar *ivars = class_copyIvarList(object_getClass(object), &count);
+    for (unsigned i = 0; i < count && *budget > 0; i++) {
+        const char *type = ivar_getTypeEncoding(ivars[i]);
+        if (!type || type[0] != '@') continue;
+        id value = object_getIvar(object, ivars[i]);
+        if (!value) continue;
+        NSString *kind = NSStringFromClass([value class]);
+        NSString *name = [NSString stringWithUTF8String:ivar_getName(ivars[i])];
+        if (![kind localizedCaseInsensitiveContainsString:@"player"] &&
+            ![kind localizedCaseInsensitiveContainsString:@"audio"] &&
+            ![kind localizedCaseInsensitiveContainsString:@"render"] &&
+            ![name localizedCaseInsensitiveContainsString:@"player"] &&
+            ![name localizedCaseInsensitiveContainsString:@"audio"]) continue;
+        (*budget)--;
+        os_log(OS_LOG_DEFAULT, "[TransDuckAudioGraph] parent=%{public}s ivar=%{public}s class=%{public}s", NSStringFromClass([object class]).UTF8String, name.UTF8String, kind.UTF8String);
+        if (depth > 0) TDLogPlayerObjects(value, depth - 1, budget);
+    }
+    free(ivars);
 }
 static NSArray<NSDictionary *> *TDModels(void) {
     return @[
@@ -667,6 +691,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (!player) {
         if (!self.loggedMissingOriginalPlayer) {
             NSLog(@"[TransDuckAudio] original AVPlayer layer unavailable");
+            int budget = 30;
+            TDLogPlayerObjects(self.player.activeVideo, 2, &budget);
             self.loggedMissingOriginalPlayer = YES;
         }
         return;
