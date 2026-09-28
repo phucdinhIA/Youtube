@@ -68,6 +68,11 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) UIButton *captionColorButton;
 @property (nonatomic, strong) UISlider *captionOpacitySlider;
 @property (nonatomic, strong) UISwitch *originalFirstSwitch;
+@property (nonatomic, strong) UIActivityIndicatorView *activity;
+@property (nonatomic) BOOL awaitingSession;
+- (void)persistSettings;
+- (void)refreshActivity;
+- (void)speechVolumeChanged;
 @end
 
 @interface TDVoicePicker : UITableViewController <UISearchResultsUpdating>
@@ -122,28 +127,34 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) BOOL originalMuteCaptured;
 @property (nonatomic, weak) YTSingleVideoController *mutedVideo;
 @property (nonatomic) BOOL preparing;
+@property (nonatomic) BOOL resumeAfterPrepare;
 @property (nonatomic) float speechVolume;
 @property (nonatomic) NSUInteger translatedCount;
 @property (nonatomic) NSUInteger synthesizedCount;
+@property (nonatomic) NSUInteger translationInFlight;
 @property (nonatomic) BOOL translationComplete;
-@property (nonatomic) BOOL synthesisInFlight;
+@property (nonatomic) NSUInteger synthesisInFlight;
 @property (nonatomic) BOOL startedPlayback;
+@property (nonatomic) NSUInteger initialCueIndex;
 @property (nonatomic, strong) NSMutableSet<NSString *> *downloads;
 @property (nonatomic, strong) NSMutableArray<NSValue *> *translationRanges;
 @property (nonatomic, strong) NSMutableArray<NSValue *> *speechRanges;
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
 - (void)checkSession:(void (^)(BOOL))completion;
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume;
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume resumeAfterPrepare:(BOOL)resumeAfterPrepare;
 - (void)stop;
 - (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion;
-- (void)fetchCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
+- (void)fetchCaptionsForVideo:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
+- (void)fetchNativeCaptionsForVideo:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
+- (void)fetchNativeCaptionTrackAtIndex:(NSUInteger)index tracks:(NSArray<YTICaptionTrackEntry *> *)tracks videoID:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
 - (void)saveSubtitle:(NSString *)srt videoID:(NSString *)videoID completion:(void (^)(NSError *))completion;
 - (void)fetchDomains:(void (^)(NSArray<NSDictionary *> *))completion;
 - (void)attachCaptionToPlayerView;
 - (void)translateNext:(NSUInteger)generation;
 - (void)translatedRange:(NSRange)range generation:(NSUInteger)generation;
 - (NSRange)takeNearestRangeFrom:(NSMutableArray<NSValue *> *)ranges;
+- (void)releaseInitialBuffer;
 @end
 
 @implementation TDManager
@@ -219,6 +230,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }] resume];
 }
 - (void)stop {
+    YTPlayerViewController *resumePlayer = self.player;
+    NSString *resumeVideoID = self.videoID;
+    BOOL resume = self.resumeAfterPrepare;
+    self.resumeAfterPrepare = NO;
     self.generation++;
     [self.timer invalidate];
     self.timer = nil;
@@ -238,24 +253,33 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.preparing = NO;
     self.translatedCount = 0;
     self.synthesizedCount = 0;
+    self.translationInFlight = 0;
     self.translationComplete = NO;
-    self.synthesisInFlight = NO;
+    self.synthesisInFlight = 0;
     self.startedPlayback = NO;
+    self.initialCueIndex = 0;
     self.videoID = nil;
     self.player = nil;
     self.status = @"Đã dừng.";
+    if (resume && [resumePlayer.currentVideoID isEqualToString:resumeVideoID]) [resumePlayer play];
 }
 - (void)fail:(NSString *)message generation:(NSUInteger)generation {
     if (generation != self.generation) return;
     [self stop];
     self.status = message;
 }
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume {
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume resumeAfterPrepare:(BOOL)resumeAfterPrepare {
+    self.resumeAfterPrepare = NO;
     [self stop];
     NSString *videoID = player.currentVideoID;
-    if (!videoID.length || player.isPlayingAd) { self.status = @"Hãy mở một video trước."; return; }
+    if (!videoID.length || player.isPlayingAd) {
+        self.status = @"Hãy mở một video trước.";
+        if (resumeAfterPrepare) [player play];
+        return;
+    }
     self.player = player;
     self.videoID = videoID;
+    self.resumeAfterPrepare = resumeAfterPrepare;
     self.model = model;
     self.voice = voice;
     self.targetLanguage = targetLanguage;
@@ -270,7 +294,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.preparing = YES;
     NSUInteger generation = self.generation;
     self.status = @"Đang tải phụ đề…";
-    [self fetchCaptionsForVideo:videoID completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
+    [self fetchCaptionsForVideo:videoID player:player completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
         if (generation != self.generation) return;
         if (![self.player.currentVideoID isEqualToString:videoID]) { [self stop]; return; }
         if (error || !cues.count) { [self fail:error.localizedDescription ?: @"Video chưa có phụ đề khả dụng trên TransDuck." generation:generation]; return; }
@@ -282,6 +306,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             [maxEnds addObject:@(latestEnd)];
         }
         self.prefixMaxEnd = maxEnds;
+        CGFloat initialTime = player.currentVideoMediaTime;
+        if (!isfinite(initialTime) || initialTime < 0) initialTime = 0;
+        for (NSUInteger i = 1; i < cues.count && [cues[i][@"start"] doubleValue] <= initialTime; i++) self.initialCueIndex = i;
         NSUInteger batchSize = [self.model isEqualToString:@"google"] ? 50 : 10;
         self.translationRanges = [NSMutableArray array];
         self.speechRanges = [NSMutableArray array];
@@ -289,10 +316,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             [self.translationRanges addObject:[NSValue valueWithRange:NSMakeRange(offset, MIN(batchSize, cues.count - offset))]];
         }
         self.status = [NSString stringWithFormat:@"Đang dịch %lu câu…", (unsigned long)cues.count];
-        [self translateNext:generation];
+        for (NSUInteger i = 0; i < 3; i++) [self translateNext:generation];
     }];
 }
-- (void)fetchCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
+- (void)fetchCaptionsForVideo:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
     NSURLComponents *userParts = [NSURLComponents componentsWithString:[TDBaseURL stringByAppendingString:@"/api/v2/subtitle/getUserSubtitleList"]];
     userParts.queryItems = @[[NSURLQueryItem queryItemWithName:@"videoId" value:videoID]];
     NSString *userPath = [userParts.URL.absoluteString substringFromIndex:TDBaseURL.length];
@@ -300,16 +327,17 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSArray *saved = [json isKindOfClass:NSDictionary.class] ? json[@"subtitles"] : nil;
         NSArray *parsed = [self parseCaptionItems:saved];
         if (parsed.count) { completion(parsed, nil); return; }
-        [self fetchOriginalCaptionsForVideo:videoID completion:completion];
+        [self fetchOriginalCaptionsForVideo:videoID player:player completion:completion];
     }];
 }
-- (void)fetchOriginalCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
+- (void)fetchOriginalCaptionsForVideo:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
     NSURLComponents *parts = [NSURLComponents componentsWithString:[TDBaseURL stringByAppendingString:@"/api/v2/subtitle/getYoutubeSubtitleList"]];
     parts.queryItems = @[[NSURLQueryItem queryItemWithName:@"videoId" value:videoID], [NSURLQueryItem queryItemWithName:@"version" value:@"1.0"]];
     NSString *path = [parts.URL.absoluteString substringFromIndex:TDBaseURL.length];
     [self request:path method:@"GET" body:nil completion:^(id json, NSError *error) {
-        if (error || ![json isKindOfClass:NSArray.class]) { completion(nil, error ?: [NSError errorWithDomain:@"TransDuck" code:422 userInfo:@{NSLocalizedDescriptionKey:@"Không đọc được phụ đề."}]); return; }
-        completion([self parseCaptionItems:json], nil);
+        NSArray *parsed = !error && [json isKindOfClass:NSArray.class] ? [self parseCaptionItems:json] : @[];
+        if (parsed.count) { completion(parsed, nil); return; }
+        [self fetchNativeCaptionsForVideo:videoID player:player completion:completion];
     }];
 }
 - (NSArray<NSMutableDictionary *> *)parseCaptionItems:(NSArray *)items {
@@ -326,6 +354,65 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [cues sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"start"] compare:b[@"start"]]; }];
     for (NSUInteger i = 0; i < cues.count; i++) cues[i][@"index"] = @(i);
     return cues;
+}
+- (NSArray<NSMutableDictionary *> *)parseNativeCaptionJSON:(NSData *)data {
+    NSDictionary *payload = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSArray *events = [payload isKindOfClass:NSDictionary.class] ? payload[@"events"] : nil;
+    if (![events isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray<NSMutableDictionary *> *cues = [NSMutableArray array];
+    for (NSDictionary *event in events) {
+        if (![event isKindOfClass:NSDictionary.class]) continue;
+        double start = [event[@"tStartMs"] doubleValue] / 1000.0;
+        double duration = [event[@"dDurationMs"] doubleValue] / 1000.0;
+        NSArray *segments = event[@"segs"];
+        if (![segments isKindOfClass:NSArray.class] || !isfinite(start) || !isfinite(duration) || start < 0 || duration <= 0) continue;
+        NSMutableString *text = [NSMutableString string];
+        for (NSDictionary *segment in segments) {
+            NSString *part = [segment isKindOfClass:NSDictionary.class] ? segment[@"utf8"] : nil;
+            if ([part isKindOfClass:NSString.class]) [text appendString:part];
+        }
+        NSString *clean = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (clean.length) [cues addObject:[@{@"text":clean, @"start":@(start), @"end":@(start + duration)} mutableCopy]];
+    }
+    [cues sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"start"] compare:b[@"start"]]; }];
+    for (NSUInteger i = 0; i < cues.count; i++) cues[i][@"index"] = @(i);
+    return cues;
+}
+- (void)fetchNativeCaptionsForVideo:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
+    if (![player.currentVideoID isEqualToString:videoID]) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:409 userInfo:@{NSLocalizedDescriptionKey:@"Video đã thay đổi."}]); return; }
+    YTPlayerResponse *response = [player respondsToSelector:@selector(contentPlayerResponse)] ? player.contentPlayerResponse : nil;
+    if (!response) response = player.playerResponse;
+    NSArray *available = response.playerData.captions.playerCaptionsTracklistRenderer.captionTracksArray;
+    if (![available isKindOfClass:NSArray.class] || !available.count) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"Video chưa có phụ đề khả dụng trong trình phát YouTube."}]); return; }
+    NSString *activeVSS = player.activeVideo.activeCaptionTrack.VSSID;
+    NSMutableArray<YTICaptionTrackEntry *> *tracks = [NSMutableArray array];
+    for (YTICaptionTrackEntry *track in available) if ([track.vssId isEqualToString:activeVSS]) [tracks addObject:track];
+    for (YTICaptionTrackEntry *track in available) if (![tracks containsObject:track]) [tracks addObject:track];
+    [self fetchNativeCaptionTrackAtIndex:0 tracks:tracks videoID:videoID player:player completion:completion];
+}
+- (void)fetchNativeCaptionTrackAtIndex:(NSUInteger)index tracks:(NSArray<YTICaptionTrackEntry *> *)tracks videoID:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
+    if (index >= tracks.count) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"YouTube có track phụ đề nhưng không tải được nội dung."}]); return; }
+    NSString *baseURL = tracks[index].baseURL;
+    NSURLComponents *parts = [NSURLComponents componentsWithString:baseURL];
+    NSString *host = parts.host.lowercaseString;
+    if (![parts.scheme.lowercaseString isEqualToString:@"https"] || !([host isEqualToString:@"youtube.com"] || [host hasSuffix:@".youtube.com"])) {
+        [self fetchNativeCaptionTrackAtIndex:index + 1 tracks:tracks videoID:videoID player:player completion:completion];
+        return;
+    }
+    NSMutableArray<NSURLQueryItem *> *items = [NSMutableArray array];
+    for (NSURLQueryItem *item in parts.queryItems) if (![item.name isEqualToString:@"fmt"]) [items addObject:item];
+    [items addObject:[NSURLQueryItem queryItemWithName:@"fmt" value:@"json3"]];
+    parts.queryItems = items;
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:parts.URL];
+    request.timeoutInterval = 20;
+    [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        NSArray *cues = !error && [http isKindOfClass:NSHTTPURLResponse.class] && http.statusCode == 200 && data.length ? [self parseNativeCaptionJSON:data] : @[];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (cues.count) completion(cues, nil);
+            else [self fetchNativeCaptionTrackAtIndex:index + 1 tracks:tracks videoID:videoID player:player completion:completion];
+        });
+    }] resume];
 }
 - (void)saveSubtitle:(NSString *)srt videoID:(NSString *)videoID completion:(void (^)(NSError *))completion {
     [self request:@"/api/v2/subtitle/saveUserSubtitle" method:@"POST" body:@{@"videoId":videoID, @"srt":srt} completion:^(id json, NSError *error) {
@@ -351,7 +438,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion {
     NSString *videoID = player.currentVideoID;
     if (!videoID.length) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:400 userInfo:@{NSLocalizedDescriptionKey:@"Hãy mở video trước."}]); return; }
-    [self fetchCaptionsForVideo:videoID completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
+    [self fetchCaptionsForVideo:videoID player:player completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
         if (error || !cues.count) { completion(nil, error ?: [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"Video chưa có phụ đề để tóm tắt."}]); return; }
         NSMutableArray *subtitles = [NSMutableArray arrayWithCapacity:cues.count];
         for (NSDictionary *cue in cues) [subtitles addObject:@{@"text":cue[@"text"], @"start":cue[@"start"], @"end":cue[@"end"]}];
@@ -392,12 +479,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)translateNext:(NSUInteger)generation {
     if (generation != self.generation) return;
     if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    if (self.translationInFlight >= 3) return;
     if (!self.translationRanges.count) {
-        self.translationComplete = YES;
-        [self finishIfReady];
+        if (!self.translationInFlight) { self.translationComplete = YES; [self finishIfReady]; }
         return;
     }
     NSRange range = [self takeNearestRangeFrom:self.translationRanges];
+    self.translationInFlight++;
     NSUInteger offset = range.location;
     NSArray *batch = [self.cues subarrayWithRange:range];
     if ([self.model isEqualToString:@"google"]) {
@@ -437,6 +525,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)translatedRange:(NSRange)range generation:(NSUInteger)generation {
     if (generation != self.generation) return;
     if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    self.translationInFlight--;
     self.translatedCount += range.length;
     if (!self.startedPlayback) { self.startedPlayback = YES; [self beginPlayback:generation]; }
     if (self.speech) {
@@ -444,21 +533,30 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             [self.speechRanges addObject:[NSValue valueWithRange:NSMakeRange(offset, MIN(10, NSMaxRange(range) - offset))]];
         }
         [self synthesizeAvailable:generation];
-    }
+        [self synthesizeAvailable:generation];
+    } else if (NSLocationInRange(self.initialCueIndex, range)) [self releaseInitialBuffer];
     self.status = [NSString stringWithFormat:@"Đã dịch %lu/%lu câu%@", (unsigned long)self.translatedCount, (unsigned long)self.cues.count, self.speech ? @" · đang chuẩn bị giọng…" : @""];
     [self translateNext:generation];
 }
 - (void)finishIfReady {
     if (!self.translationComplete) return;
     if (self.speech && (self.synthesisInFlight || self.synthesizedCount < self.cues.count)) return;
-    self.preparing = NO;
+    [self releaseInitialBuffer];
     self.status = self.speech ? @"Phụ đề và lồng tiếng đã sẵn sàng." : @"Phụ đề đã sẵn sàng.";
 }
+- (void)releaseInitialBuffer {
+    if (!self.preparing) return;
+    self.preparing = NO;
+    BOOL resume = self.resumeAfterPrepare;
+    self.resumeAfterPrepare = NO;
+    self.status = @"Đoạn đầu đã sẵn sàng · đang chuẩn bị phần còn lại…";
+    if (resume && [self.player.currentVideoID isEqualToString:self.videoID]) [self.player play];
+}
 - (void)synthesizeAvailable:(NSUInteger)generation {
-    if (generation != self.generation || self.synthesisInFlight || !self.speech) return;
+    if (generation != self.generation || self.synthesisInFlight >= 2 || !self.speech) return;
     if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
     if (!self.speechRanges.count) { [self finishIfReady]; return; }
-    self.synthesisInFlight = YES;
+    self.synthesisInFlight++;
     NSRange range = [self takeNearestRangeFrom:self.speechRanges];
     NSUInteger offset = range.location;
     NSArray *batch = [self.cues subarrayWithRange:range];
@@ -468,13 +566,14 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self request:@"/api/v2/dubbing/generateDubbing" method:@"POST" body:body completion:^(id json, NSError *error) {
         if (generation != self.generation) return;
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleDubbingResults"] : nil;
-        self.synthesisInFlight = NO;
+        self.synthesisInFlight--;
         if (error || results.count != batch.count) {
             self.speech = NO;
             [self.speechRanges removeAllObjects];
             if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
             self.originalMuteCaptured = NO;
             self.mutedVideo = nil;
+            if (self.cues[self.initialCueIndex][@"translated"]) [self releaseInitialBuffer];
             [self finishIfReady];
             self.status = error.localizedDescription ?: @"TTS không đầy đủ; phụ đề vẫn hoạt động.";
             return;
@@ -490,6 +589,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         while (current + 1 < (NSInteger)self.cues.count && [self.cues[(NSUInteger)(current + 1)][@"start"] doubleValue] <= now) current++;
         [self prefetchNearIndex:current];
         self.synthesizedCount += range.length;
+        if (NSLocationInRange(self.initialCueIndex, range)) [self releaseInitialBuffer];
         [self synthesizeAvailable:generation];
     }];
 }
@@ -778,7 +878,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     NSString *videoID = self.player.currentVideoID;
     self.videoID = videoID;
     __weak typeof(self) weakSelf = self;
-    [[TDManager shared] fetchCaptionsForVideo:videoID completion:^(NSArray<NSDictionary *> *cues, NSError *error) {
+    [[TDManager shared] fetchCaptionsForVideo:videoID player:self.player completion:^(NSArray<NSDictionary *> *cues, NSError *error) {
         if (!weakSelf || ![weakSelf.player.currentVideoID isEqualToString:videoID]) return;
         if (error || !cues.count) { weakSelf.statusLabel.text = error.localizedDescription ?: @"Video chưa có phụ đề."; weakSelf.textView.text = @""; return; }
         NSMutableArray *blocks = [NSMutableArray arrayWithCapacity:cues.count];
@@ -953,11 +1053,18 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     self.speechVolumeSlider.value = [defaults objectForKey:@"TDSpeechVolume"] ? [defaults floatForKey:@"TDSpeechVolume"] : 1;
     [stack addArrangedSubview:[self label:@"Âm lượng lồng tiếng"]];
     [stack addArrangedSubview:self.speechVolumeSlider];
+    for (UIControl *control in @[self.speechSwitch, self.bilingualSwitch, self.rulesSwitch, self.captionSwitch, self.subtitleSizeSlider, self.captionOpacitySlider, self.originalFirstSwitch, self.muteSwitch]) {
+        [control addTarget:self action:@selector(persistSettings) forControlEvents:UIControlEventValueChanged];
+    }
+    [self.speechVolumeSlider addTarget:self action:@selector(speechVolumeChanged) forControlEvents:UIControlEventValueChanged];
     self.startButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.startButton setTitle:@"Dịch và phát" forState:UIControlStateNormal];
     self.startButton.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
     [self.startButton addTarget:self action:@selector(start) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:self.startButton];
+    self.activity = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    self.activity.hidesWhenStopped = YES;
+    [stack addArrangedSubview:self.activity];
     self.summaryButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.summaryButton setTitle:@"Tóm tắt video" forState:UIControlStateNormal];
     [self.summaryButton addTarget:self action:@selector(showSummary) forControlEvents:UIControlEventTouchUpInside];
@@ -978,7 +1085,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     self.statusLabel.textColor = UIColor.secondaryLabelColor;
     [stack addArrangedSubview:self.statusLabel];
     __weak typeof(self) weakSelf = self;
-    [TDManager shared].statusChanged = ^(NSString *status) { weakSelf.statusLabel.text = status; weakSelf.startButton.enabled = ![TDManager shared].preparing; };
+    [TDManager shared].statusChanged = ^(NSString *status) { weakSelf.statusLabel.text = status; [weakSelf refreshActivity]; };
     [[TDManager shared] checkSession:^(BOOL signedIn) { if (signedIn) [login setTitle:@"Đã đăng nhập · đổi tài khoản" forState:UIControlStateNormal]; }];
     [[TDManager shared] fetchDomains:^(NSArray<NSDictionary *> *domains) {
         weakSelf.domains = domains;
@@ -1025,6 +1132,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
                 break;
             }
         }
+        [weakSelf persistSettings];
     };
     [self.navigationController pushViewController:picker animated:YES];
 }
@@ -1046,18 +1154,19 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
                 }
             }
         }
+        [weakSelf persistSettings];
     };
     [self.navigationController pushViewController:picker animated:YES];
 }
 - (void)choose:(NSString *)title options:(NSArray<NSDictionary *> *)options button:(UIButton *)button {
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSDictionary *option in options) [sheet addAction:[UIAlertAction actionWithTitle:option[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) { [button setTitle:option[@"name"] forState:UIControlStateNormal]; button.accessibilityValue = option[@"id"]; }]];
+    for (NSDictionary *option in options) [sheet addAction:[UIAlertAction actionWithTitle:option[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) { [button setTitle:option[@"name"] forState:UIControlStateNormal]; button.accessibilityValue = option[@"id"]; [self persistSettings]; }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = button;
     sheet.popoverPresentationController.sourceRect = button.bounds;
     [self presentViewController:sheet animated:YES completion:nil];
 }
-- (void)start {
+- (void)persistSettings {
     NSString *model = self.modelButton.accessibilityValue ?: @"gemini-3.5-flash-lite";
     NSString *voice = self.voiceButton.accessibilityValue ?: @"vi-VN-HoaiMyNeural";
     NSString *language = self.languageButton.accessibilityValue ?: @"vi-VN";
@@ -1078,9 +1187,42 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [defaults setBool:self.originalFirstSwitch.on forKey:@"TDOriginalFirst"];
     [defaults setBool:self.muteSwitch.on forKey:@"TDMuteOriginal"];
     [defaults setFloat:self.speechVolumeSlider.value forKey:@"TDSpeechVolume"];
+}
+- (void)refreshActivity {
+    BOOL busy = self.awaitingSession || [TDManager shared].preparing;
+    if (busy) [self.activity startAnimating];
+    else [self.activity stopAnimating];
+    self.startButton.enabled = !busy;
+}
+- (void)speechVolumeChanged {
+    [self persistSettings];
+    TDManager *manager = [TDManager shared];
+    manager.speechVolume = self.speechVolumeSlider.value;
+    manager.audioPlayer.volume = manager.speechVolume;
+}
+- (void)start {
+    if (!self.player.currentVideoID.length) { self.statusLabel.text = @"Hãy mở video trước."; return; }
+    [self persistSettings];
+    NSString *model = self.modelButton.accessibilityValue ?: @"gemini-3.5-flash-lite";
+    NSString *voice = self.voiceButton.accessibilityValue ?: @"vi-VN-HoaiMyNeural";
+    NSString *language = self.languageButton.accessibilityValue ?: @"vi-VN";
+    NSString *domain = self.domainButton.accessibilityValue ?: @"general";
+    NSString *requestedVideoID = self.player.currentVideoID;
+    BOOL shouldResume = self.player.playerState == 3;
+    if (shouldResume) [self.player pause];
+    self.awaitingSession = YES;
+    self.statusLabel.text = @"Đang kiểm tra tài khoản…";
+    [self refreshActivity];
     [[TDManager shared] checkSession:^(BOOL signedIn) {
-        if (!signedIn) { self.statusLabel.text = @"Đăng nhập TransDuck trước khi dịch."; return; }
-        [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language domain:domain speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on showCaptions:self.captionSwitch.on subtitleSize:self.subtitleSizeSlider.value translationRulesEnabled:self.rulesSwitch.on muteOriginal:self.muteSwitch.on speechVolume:self.speechVolumeSlider.value];
+        self.awaitingSession = NO;
+        if (!signedIn || ![self.player.currentVideoID isEqualToString:requestedVideoID]) {
+            if (shouldResume && [self.player.currentVideoID isEqualToString:requestedVideoID]) [self.player play];
+            self.statusLabel.text = signedIn ? @"Video đã thay đổi." : @"Đăng nhập TransDuck trước khi dịch.";
+            [self refreshActivity];
+            return;
+        }
+        [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language domain:domain speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on showCaptions:self.captionSwitch.on subtitleSize:self.subtitleSizeSlider.value translationRulesEnabled:self.rulesSwitch.on muteOriginal:self.muteSwitch.on speechVolume:self.speechVolumeSlider.value resumeAfterPrepare:shouldResume];
+        [self refreshActivity];
     }];
 }
 - (void)showSummary {
