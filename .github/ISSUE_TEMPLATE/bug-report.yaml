@@ -1,0 +1,74 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: "bug"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before You Submit Your Issue**
+        - This is not a right place to ask questions. Use [Discussions](https://github.com/yattee/yattee/discussions) or contact directly via [Discord](https://yattee.stream/discord) or [Matrix Channel](https://matrix.to/#/#Yattee:matrix.org)
+
+  - type: checkboxes
+    attributes:
+      label: Guidelines
+      description: Please ensure you've completed the following
+      options:
+        - label: I have searched the [issue tracker](https://github.com/yattee/yattee/issues) and I haven't found bug report like this
+          required: true
+
+  - type: textarea
+    attributes:
+      label: Current Behavior
+      description: Describe what happened and the steps you have done to encounter the problem
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Expected Behavior
+      description: Describe what you expected to happen
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: Device & OS Version
+      description: What device and operating system version are you running? You can find it in device settings
+      placeholder: e.g. iPhone, iOS 16.1
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: App Build
+      description: What build of the application are you running? You can find this in the bottom of the Settings page
+      placeholder: e.g. 112
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: App Settings
+      description: If the issue is related to some non-default configuration, please provide the settings you have changed
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Crash log
+      description: If you are reporing a crash, attach crash log here
+      placeholder: |
+          1. Go to 'Settings'
+          2. Click on 'Privacy'
+          3. Scroll down and open 'Analytics & Improvements'
+          4. Go to 'Analytics Data'
+          4. See crash log
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Screenshots, Videos and other files
+      description: Submit screenshots, video of the issue or other files that can help to understand the problem better. If you are reporting issue with playback in MPV, attach [logs from MPV](https://github.com/yattee/yattee/wiki/Getting-MPV-logs)
+    validations:
+      required: false

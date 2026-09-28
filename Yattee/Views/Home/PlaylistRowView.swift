@@ -1,0 +1,51 @@
+//
+//  PlaylistRowView.swift
+//  Yattee
+//
+//  Row view for displaying a playlist in lists.
+//
+
+import SwiftUI
+import NukeUI
+
+struct PlaylistRowView: View {
+    let playlist: LocalPlaylist
+    var style: VideoRowStyle = .regular
+
+    private var titleFont: Font {
+        style == .compact ? .subheadline : .headline
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Thumbnail
+            LazyImage(url: playlist.thumbnailURL) { state in
+                if let image = state.image {
+                    image
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Rectangle()
+                        .fill(.quaternary)
+                        .overlay {
+                            Image(systemName: "music.note.list")
+                                .foregroundStyle(.secondary)
+                        }
+                }
+            }
+            .frame(width: style.thumbnailWidth, height: style.thumbnailHeight)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            // Info
+            VStack(alignment: .leading, spacing: 4) {
+                Text(playlist.title)
+                    .font(titleFont)
+                    .lineLimit(style == .large ? 2 : 1)
+
+                Text("playlist.videoCountDuration \(playlist.videoCount) \(playlist.formattedTotalDuration)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}

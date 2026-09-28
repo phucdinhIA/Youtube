@@ -1,0 +1,44 @@
+name: Build unsigned TransDuck iPad IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - transduck-ipad-build
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          xcodebuild -version
+          xcodebuild -list -project Yattee.xcodeproj
+      - name: Build for iPadOS
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Yattee.xcodeproj \
+            -scheme Yattee \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/yattee-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Package unsigned IPA for Sideloadly
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/yattee-build/Build/Products/Release-iphoneos/Yattee.app"
+          test -d "$app"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$app" "$RUNNER_TEMP/ipa/Payload/Yattee.app"
+          cd "$RUNNER_TEMP/ipa"
+          ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/TransDuck-Yattee-unsigned.ipa"
+          unzip -t "$GITHUB_WORKSPACE/TransDuck-Yattee-unsigned.ipa"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TransDuck-Yattee-unsigned
+          path: TransDuck-Yattee-unsigned.ipa
+          if-no-files-found: error

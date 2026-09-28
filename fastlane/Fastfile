@@ -1,0 +1,390 @@
+# Yattee v2 Fastlane configuration
+# Single unified "Yattee" scheme, platform selected via destination parameter
+
+APP_NAME = ENV['APP_NAME'] || 'Yattee'
+DEVELOPER_KEY_ID = ENV['DEVELOPER_KEY_ID']
+DEVELOPER_KEY_ISSUER_ID = ENV['DEVELOPER_KEY_ISSUER_ID']
+DEVELOPER_KEY_CONTENT = ENV['DEVELOPER_KEY_CONTENT']
+TEAM_ID = ENV['TEAM_ID']
+TEMP_KEYCHAIN_USER = ENV['TEMP_KEYCHAIN_USER']
+TEMP_KEYCHAIN_PASSWORD = ENV['TEMP_KEYCHAIN_PASSWORD']
+DEVELOPER_APP_IDENTIFIER = ENV['DEVELOPER_APP_IDENTIFIER']
+GIT_AUTHORIZATION = ENV['GIT_AUTHORIZATION']
+
+XCODEPROJ = "#{APP_NAME}.xcodeproj"
+SCHEME = APP_NAME
+
+def delete_temp_keychain(name)
+  delete_keychain(
+    name: name
+  ) if File.exist? File.expand_path("~/Library/Keychains/#{name}-db")
+end
+
+def create_temp_keychain(name, password)
+  create_keychain(
+    name: name,
+    password: password,
+    unlock: false,
+    timeout: 0
+  )
+end
+
+def ensure_temp_keychain(name, password)
+  delete_temp_keychain(name)
+  create_temp_keychain(name, password)
+end
+
+# Beta groups are managed in App Store Connect; fetching them at upload time
+# means new groups get builds without touching CI config.
+def all_testflight_group_names(api_key)
+  Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+  app = Spaceship::ConnectAPI::App.find(DEVELOPER_APP_IDENTIFIER)
+  UI.user_error!("App #{DEVELOPER_APP_IDENTIFIER} not found on App Store Connect") if app.nil?
+  # Internal groups can't be assigned builds via the API (ASC rejects it);
+  # they get access to new builds automatically anyway.
+  groups = app.get_beta_groups.reject(&:is_internal_group).map(&:name)
+  UI.user_error!("No TestFlight beta groups found for #{DEVELOPER_APP_IDENTIFIER}") if groups.empty?
+  UI.message("Distributing build to TestFlight groups: #{groups.join(', ')}")
+  groups
+end
+
+add_extra_platforms(platforms: [:tvos])
+
+before_all do
+  # Skipping update_fastlane in CI for stability
+end
+
+desc "Get latest TestFlight build number across all platforms"
+lane :latest_build_number do
+  api_key = app_store_connect_api_key(
+    key_id: DEVELOPER_KEY_ID,
+    issuer_id: DEVELOPER_KEY_ISSUER_ID,
+    key_content: DEVELOPER_KEY_CONTENT,
+    is_key_content_base64: true
+  )
+
+  ios_build = latest_testflight_build_number(api_key: api_key, app_identifier: DEVELOPER_APP_IDENTIFIER, platform: "ios")
+  tvos_build = latest_testflight_build_number(api_key: api_key, app_identifier: DEVELOPER_APP_IDENTIFIER, platform: "appletvos")
+  macos_build = latest_testflight_build_number(api_key: api_key, app_identifier: DEVELOPER_APP_IDENTIFIER, platform: "osx")
+
+  max_build = [ios_build, tvos_build, macos_build].max
+  # Write to repo root (Fastfile is in fastlane/ subdir)
+  output_path = File.expand_path("../latest_build_number.txt", __dir__)
+  File.write(output_path, max_build.to_s)
+  UI.success("Latest TestFlight build number: #{max_build}")
+  max_build
+end
+
+desc "Bump build number and commit"
+lane :bump_build do
+  increment_build_number(xcodeproj: XCODEPROJ)
+
+  commit_version_bump(
+    message: "Bump build number to #{get_build_number(xcodeproj: XCODEPROJ)}",
+    xcodeproj: XCODEPROJ
+  )
+end
+
+desc "Bump version number and commit"
+lane :bump_version do
+  increment_version_number(xcodeproj: XCODEPROJ)
+
+  commit_version_bump(
+    message: "Bump version number to #{get_version_number(xcodeproj: XCODEPROJ, target: SCHEME)}",
+    xcodeproj: XCODEPROJ
+  )
+end
+
+platform :ios do
+  desc "Push a new beta build to TestFlight"
+  lane :beta do
+    ensure_temp_keychain(TEMP_KEYCHAIN_USER, TEMP_KEYCHAIN_PASSWORD)
+
+    api_key = app_store_connect_api_key(
+      key_id: DEVELOPER_KEY_ID,
+      issuer_id: DEVELOPER_KEY_ISSUER_ID,
+      key_content: DEVELOPER_KEY_CONTENT,
+      is_key_content_base64: true
+    )
+
+    build = get_build_number(xcodeproj: XCODEPROJ)
+    version = get_version_number(
+      xcodeproj: XCODEPROJ,
+      target: SCHEME
+    )
+
+    match(
+      type: 'appstore',
+      platform: 'ios',
+      app_identifier: ["#{DEVELOPER_APP_IDENTIFIER}", "#{DEVELOPER_APP_IDENTIFIER}.ShareExtension"],
+      git_basic_authorization: Base64.strict_encode64(GIT_AUTHORIZATION),
+      readonly: true,
+      keychain_name: TEMP_KEYCHAIN_USER,
+      keychain_password: TEMP_KEYCHAIN_PASSWORD,
+      api_key: api_key
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: XCODEPROJ,
+      team_id: TEAM_ID,
+      code_sign_identity: "Apple Distribution",
+      profile_name: "match AppStore #{DEVELOPER_APP_IDENTIFIER}",
+      targets: [SCHEME]
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: XCODEPROJ,
+      team_id: TEAM_ID,
+      code_sign_identity: "Apple Distribution",
+      profile_name: "match AppStore #{DEVELOPER_APP_IDENTIFIER}.ShareExtension",
+      targets: ["YatteeShareExtension"]
+    )
+
+    build_app(
+      scheme: SCHEME,
+      destination: "generic/platform=iOS",
+      output_directory: "fastlane/builds/#{version}-#{build}/iOS",
+      output_name: "#{APP_NAME}-#{version}-iOS.ipa",
+      export_options: {
+        provisioningProfiles: {
+          "#{DEVELOPER_APP_IDENTIFIER}" => "match AppStore #{DEVELOPER_APP_IDENTIFIER}",
+          "#{DEVELOPER_APP_IDENTIFIER}.ShareExtension" => "match AppStore #{DEVELOPER_APP_IDENTIFIER}.ShareExtension"
+        }
+      }
+    )
+
+    changelog_path = File.expand_path('../CHANGELOG.md', __dir__)
+    changelog = File.exist?(changelog_path) ? File.read(changelog_path) : ""
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
+      changelog: changelog,
+      distribute_external: true,
+      groups: all_testflight_group_names(api_key)
+    )
+  end
+end
+
+platform :tvos do
+  desc "Push a new beta build to TestFlight"
+  lane :beta do
+    ensure_temp_keychain(TEMP_KEYCHAIN_USER, TEMP_KEYCHAIN_PASSWORD)
+
+    api_key = app_store_connect_api_key(
+      key_id: DEVELOPER_KEY_ID,
+      issuer_id: DEVELOPER_KEY_ISSUER_ID,
+      key_content: DEVELOPER_KEY_CONTENT,
+      is_key_content_base64: true
+    )
+
+    build = get_build_number(xcodeproj: XCODEPROJ)
+    version = get_version_number(
+      xcodeproj: XCODEPROJ,
+      target: SCHEME
+    )
+
+    match(
+      type: 'appstore',
+      platform: 'tvos',
+      app_identifier: ["#{DEVELOPER_APP_IDENTIFIER}", "#{DEVELOPER_APP_IDENTIFIER}.TopShelf"],
+      git_basic_authorization: Base64.strict_encode64(GIT_AUTHORIZATION),
+      readonly: true,
+      keychain_name: TEMP_KEYCHAIN_USER,
+      keychain_password: TEMP_KEYCHAIN_PASSWORD,
+      api_key: api_key
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: XCODEPROJ,
+      team_id: TEAM_ID,
+      code_sign_identity: "Apple Distribution",
+      profile_name: "match AppStore #{DEVELOPER_APP_IDENTIFIER} tvos",
+      targets: [SCHEME]
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: XCODEPROJ,
+      team_id: TEAM_ID,
+      code_sign_identity: "Apple Distribution",
+      profile_name: "match AppStore #{DEVELOPER_APP_IDENTIFIER}.TopShelf tvos",
+      targets: ["YatteeTopShelf"]
+    )
+
+    build_app(
+      scheme: SCHEME,
+      destination: "generic/platform=tvOS",
+      output_directory: "fastlane/builds/#{version}-#{build}/tvOS",
+      output_name: "#{APP_NAME}-#{version}-tvOS.ipa",
+      export_method: "app-store",
+      export_options: {
+        provisioningProfiles: {
+          "#{DEVELOPER_APP_IDENTIFIER}" => "match AppStore #{DEVELOPER_APP_IDENTIFIER} tvos",
+          "#{DEVELOPER_APP_IDENTIFIER}.TopShelf" => "match AppStore #{DEVELOPER_APP_IDENTIFIER}.TopShelf tvos"
+        }
+      }
+    )
+
+    changelog_path = File.expand_path('../CHANGELOG.md', __dir__)
+    changelog = File.exist?(changelog_path) ? File.read(changelog_path) : ""
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
+      changelog: changelog,
+      distribute_external: true,
+      groups: all_testflight_group_names(api_key)
+    )
+  end
+end
+
+platform :mac do
+  desc "Push a new beta build to TestFlight"
+  lane :beta do
+    ensure_temp_keychain(TEMP_KEYCHAIN_USER, TEMP_KEYCHAIN_PASSWORD)
+
+    api_key = app_store_connect_api_key(
+      key_id: DEVELOPER_KEY_ID,
+      issuer_id: DEVELOPER_KEY_ISSUER_ID,
+      key_content: DEVELOPER_KEY_CONTENT,
+      is_key_content_base64: true
+    )
+
+    build = get_build_number(xcodeproj: XCODEPROJ)
+    version = get_version_number(
+      xcodeproj: XCODEPROJ,
+      target: SCHEME
+    )
+
+    match(
+      type: 'appstore',
+      platform: 'macos',
+      additional_cert_types: ['mac_installer_distribution'],
+      app_identifier: "#{DEVELOPER_APP_IDENTIFIER}",
+      git_basic_authorization: Base64.strict_encode64(GIT_AUTHORIZATION),
+      readonly: true,
+      keychain_name: TEMP_KEYCHAIN_USER,
+      keychain_password: TEMP_KEYCHAIN_PASSWORD,
+      api_key: api_key
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: XCODEPROJ,
+      team_id: TEAM_ID,
+      code_sign_identity: "Apple Distribution",
+      profile_name: "match AppStore #{DEVELOPER_APP_IDENTIFIER} macos",
+      targets: [SCHEME]
+    )
+
+    build_mac_app(
+      scheme: SCHEME,
+      sdk: "macosx",
+      destination: "generic/platform=macOS",
+      output_directory: "fastlane/builds/#{version}-#{build}/macOS",
+      output_name: "#{APP_NAME}-#{version}-macOS",
+      export_method: "app-store",
+      export_options: {
+        provisioningProfiles: {
+          "#{DEVELOPER_APP_IDENTIFIER}" => "match AppStore #{DEVELOPER_APP_IDENTIFIER} macos"
+        }
+      }
+    )
+
+    changelog_path = File.expand_path('../CHANGELOG.md', __dir__)
+    changelog = File.exist?(changelog_path) ? File.read(changelog_path) : ""
+
+    upload_to_testflight(
+      api_key: api_key,
+      pkg: lane_context[SharedValues::PKG_OUTPUT_PATH],
+      changelog: changelog,
+      distribute_external: true,
+      groups: all_testflight_group_names(api_key)
+    )
+  end
+
+  desc "Build for Developer ID distribution and notarize"
+  lane :build_and_notarize do
+    ensure_temp_keychain(TEMP_KEYCHAIN_USER, TEMP_KEYCHAIN_PASSWORD)
+
+    api_key = app_store_connect_api_key(
+      key_id: DEVELOPER_KEY_ID,
+      issuer_id: DEVELOPER_KEY_ISSUER_ID,
+      key_content: DEVELOPER_KEY_CONTENT,
+      is_key_content_base64: true
+    )
+
+    build = get_build_number(xcodeproj: XCODEPROJ)
+    version = get_version_number(
+      xcodeproj: XCODEPROJ,
+      target: SCHEME
+    )
+
+    match(
+      type: 'developer_id',
+      platform: 'macos',
+      app_identifier: "#{DEVELOPER_APP_IDENTIFIER}",
+      git_basic_authorization: Base64.strict_encode64(GIT_AUTHORIZATION),
+      readonly: true,
+      keychain_name: TEMP_KEYCHAIN_USER,
+      keychain_password: TEMP_KEYCHAIN_PASSWORD,
+      api_key: api_key
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: XCODEPROJ,
+      team_id: TEAM_ID,
+      code_sign_identity: "Developer ID Application",
+      profile_name: "match Direct #{DEVELOPER_APP_IDENTIFIER} macos",
+      targets: [SCHEME],
+      build_configurations: ["Release-DeveloperID"]
+    )
+
+    build_mac_app(
+      scheme: SCHEME,
+      sdk: "macosx",
+      destination: "generic/platform=macOS",
+      configuration: "Release-DeveloperID",
+      output_directory: "fastlane/builds/#{version}-#{build}/macOS",
+      output_name: APP_NAME,
+      export_method: "developer-id",
+      export_options: {
+        provisioningProfiles: {
+          "#{DEVELOPER_APP_IDENTIFIER}" => "match Direct #{DEVELOPER_APP_IDENTIFIER} macos"
+        }
+      }
+    )
+
+    notarize(
+      package: "fastlane/builds/#{version}-#{build}/macOS/#{APP_NAME}.app",
+      bundle_id: "#{DEVELOPER_APP_IDENTIFIER}",
+      api_key: api_key,
+      print_log: true
+    )
+
+    # Staple the notarization ticket so Gatekeeper doesn't need to phone home
+    # when the user first launches from Sparkle/DMG.
+    # NOTE: sh runs from the fastlane/ directory, so paths here are relative
+    # to it (no fastlane/ prefix), unlike action arguments above.
+    sh "xcrun stapler staple 'builds/#{version}-#{build}/macOS/#{APP_NAME}.app'"
+
+    # Package the stapled .app into a .zip (Sparkle) and .dmg (Homebrew / direct).
+    dir = "builds/#{version}-#{build}/macOS"
+    app = "#{dir}/#{APP_NAME}.app"
+    zip = "#{dir}/#{APP_NAME}-#{version}-macOS.zip"
+    dmg = "#{dir}/#{APP_NAME}-#{version}-macOS.dmg"
+
+    # .zip: `ditto -c -k --keepParent` is Sparkle's expected archive layout
+    # (preserves the .app wrapper, resource forks, symlinks).
+    sh "/usr/bin/ditto -c -k --keepParent '#{app}' '#{zip}'"
+
+    # .dmg: read-only UDZO, overwrites any stale image from previous runs.
+    sh "/bin/rm -f '#{dmg}'"
+    sh "/usr/bin/hdiutil create -volname '#{APP_NAME} #{version}' -srcfolder '#{app}' -ov -format UDZO '#{dmg}'"
+  end
+end

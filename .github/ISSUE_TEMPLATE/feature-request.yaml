@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an new feature or an idea to improve the existing one
+labels: "enhancement"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before You Submit Your Issue**
+        - This is not a right place to ask questions. Use [Discussions](https://github.com/yattee/yattee/discussions) or contact directly via [Discord](https://yattee.stream/discord) or [Matrix Channel](https://matrix.to/#/#Yattee:matrix.org)
+
+  - type: checkboxes
+    attributes:
+      label: Guidelines
+      description: Please ensure you've completed the following
+      options:
+        - label: I have searched the [issue tracker](https://github.com/yattee/yattee/issues) and I haven't found feature request like this
+          required: true
+
+  - type: dropdown
+    attributes:
+      label: Type
+      description: Please select a type that fits this request. Choose multiple options, if applicable
+      multiple: true
+      options:
+        - New feature
+        - Improvement to existing feature
+        - Usability improvement
+        - Visual improvement
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Describe the feature
+      description: Provide a description of the feature that you're requesting to have implemented. You can attach screenshots or mockups to help to understand it better
+      placeholder: The feature should work like this...
+    validations:
+      required: true
