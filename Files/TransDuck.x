@@ -747,16 +747,23 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     [button setTitle:title forState:UIControlStateNormal];
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    button.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    button.accessibilityLabel = title;
     return button;
 }
 - (UIView *)row:(NSString *)title control:(UIView *)control {
-    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[[self label:title], control]];
+    UILabel *name = [self label:title];
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[name, control]];
     row.axis = UILayoutConstraintAxisHorizontal;
     row.alignment = UIStackViewAlignmentCenter;
     row.spacing = 12;
-    [control setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [name setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    if ([control isKindOfClass:UIButton.class]) {
+        [control setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+        [control.widthAnchor constraintLessThanOrEqualToAnchor:row.widthAnchor multiplier:0.58].active = YES;
+    } else {
+        [control setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    }
     return row;
 }
 - (UILabel *)label:(NSString *)text {
