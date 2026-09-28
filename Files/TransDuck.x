@@ -875,6 +875,15 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     picker.selection = ^(NSDictionary *voice) {
         [weakSelf.voiceButton setTitle:voice[@"name"] forState:UIControlStateNormal];
         weakSelf.voiceButton.accessibilityValue = voice[@"id"];
+        NSArray *parts = [voice[@"id"] componentsSeparatedByString:@"-"];
+        if (parts.count >= 3) {
+            NSString *locale = [NSString stringWithFormat:@"%@-%@", parts[0], parts[1]];
+            for (NSDictionary *language in TDLanguages()) if ([language[@"id"] isEqualToString:locale]) {
+                [weakSelf.languageButton setTitle:language[@"name"] forState:UIControlStateNormal];
+                weakSelf.languageButton.accessibilityValue = locale;
+                break;
+            }
+        }
     };
     [self.navigationController pushViewController:picker animated:YES];
 }
