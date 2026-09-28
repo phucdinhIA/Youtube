@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           make clean package DEBUG=0 FINALPACKAGE=1
           test -f packages/dev.water888.youmod_2.0.0_iphoneos-arm.deb
-          dpkg-deb --contents packages/dev.water888.youmod_2.0.0_iphoneos-arm.deb | grep YouMod.dylib
+          ar t packages/dev.water888.youmod_2.0.0_iphoneos-arm.deb | grep data.tar
       - uses: actions/upload-artifact@v4
         with:
           name: TransDuck-YouMod-arm64
