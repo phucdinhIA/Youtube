@@ -68,7 +68,6 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @interface TDSummaryPanel : UITableViewController
 @property (nonatomic, weak) YTPlayerViewController *player;
 @property (nonatomic, copy) NSString *targetLanguage;
-@property (nonatomic, copy) NSString *domain;
 @property (nonatomic, strong) NSDictionary *summary;
 @property (nonatomic, strong) NSArray<NSDictionary *> *summaryRows;
 @property (nonatomic, strong) UILabel *stateLabel;
@@ -93,6 +92,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, copy) NSString *model;
 @property (nonatomic, copy) NSString *voice;
 @property (nonatomic, copy) NSString *targetLanguage;
+@property (nonatomic, copy) NSString *domain;
 @property (nonatomic, copy) NSString *status;
 @property (nonatomic, copy) void (^statusChanged)(NSString *);
 @property (nonatomic) NSUInteger generation;
