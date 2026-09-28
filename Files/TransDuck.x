@@ -48,9 +48,11 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) UISlider *speechVolumeSlider;
 @property (nonatomic, strong) UISwitch *speechSwitch;
 @property (nonatomic, strong) UISwitch *bilingualSwitch;
+@property (nonatomic, strong) UISwitch *captionSwitch;
 @property (nonatomic, strong) UISwitch *muteSwitch;
 @property (nonatomic, strong) UIButton *startButton;
 @property (nonatomic, strong) UIButton *summaryButton;
+@property (nonatomic, strong) UISlider *subtitleSizeSlider;
 @end
 
 @interface TDVoicePicker : UITableViewController <UISearchResultsUpdating>
@@ -64,6 +66,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, weak) YTPlayerViewController *player;
 @property (nonatomic, copy) NSString *targetLanguage;
 @property (nonatomic, strong) NSDictionary *summary;
+@property (nonatomic, strong) NSArray<NSDictionary *> *summaryRows;
 @property (nonatomic, strong) UILabel *stateLabel;
 @end
 
@@ -94,6 +97,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) BOOL advancing;
 @property (nonatomic) BOOL speech;
 @property (nonatomic) BOOL bilingual;
+@property (nonatomic) BOOL showCaptions;
+@property (nonatomic) float subtitleSize;
 @property (nonatomic) BOOL muteOriginal;
 @property (nonatomic) BOOL originalMuted;
 @property (nonatomic) BOOL originalMuteCaptured;
@@ -108,7 +113,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
 - (void)checkSession:(void (^)(BOOL))completion;
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage speech:(BOOL)speech bilingual:(BOOL)bilingual muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume;
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume;
 - (void)stop;
 - (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion;
 - (void)fetchCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
@@ -215,7 +220,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self stop];
     self.status = message;
 }
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage speech:(BOOL)speech bilingual:(BOOL)bilingual muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume {
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume {
     [self stop];
     NSString *videoID = player.currentVideoID;
     if (!videoID.length || player.isPlayingAd) { self.status = @"Hãy mở một video trước."; return; }
@@ -227,6 +232,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.speech = speech;
     self.speechVolume = MIN(1, MAX(0, speechVolume));
     self.bilingual = bilingual;
+    self.showCaptions = showCaptions;
+    self.subtitleSize = MIN(36, MAX(16, subtitleSize));
     self.muteOriginal = muteOriginal;
     self.preparing = YES;
     NSUInteger generation = self.generation;
@@ -400,7 +407,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     label.translatesAutoresizingMaskIntoConstraints = NO;
     label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.68];
     label.textColor = UIColor.whiteColor;
-    label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    label.font = [UIFont systemFontOfSize:self.subtitleSize weight:UIFontWeightSemibold];
     label.textAlignment = NSTextAlignmentCenter;
     label.numberOfLines = 3;
     label.layer.cornerRadius = 8;
@@ -436,7 +443,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         else if (time >= [cue[@"end"] doubleValue]) low = middle + 1;
         else { found = middle; break; }
     }
-    self.captionLabel.hidden = found < 0;
+    self.captionLabel.hidden = !self.showCaptions || found < 0;
     if (found >= 0) {
         NSDictionary *cue = self.cues[(NSUInteger)found];
         NSString *translated = cue[@"translated"] ?: cue[@"text"];
@@ -572,6 +579,15 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [[TDManager shared] summaryForPlayer:self.player targetLanguage:self.targetLanguage completion:^(NSDictionary *summary, NSError *error) {
         if (!weakSelf || ![weakSelf.player.currentVideoID isEqualToString:videoID]) return;
         weakSelf.summary = summary;
+        NSMutableArray *rows = [NSMutableArray array];
+        NSArray *highlights = [summary[@"highlights"] isKindOfClass:NSArray.class] ? summary[@"highlights"] : @[];
+        for (NSDictionary *highlight in highlights) {
+            if (![highlight isKindOfClass:NSDictionary.class]) continue;
+            [rows addObject:@{@"text":highlight[@"title"] ?: @"", @"timestamp":highlight[@"timestamp"] ?: @0, @"detail":@NO}];
+            NSArray *details = [highlight[@"details"] isKindOfClass:NSArray.class] ? highlight[@"details"] : @[];
+            for (NSDictionary *detail in details) if ([detail isKindOfClass:NSDictionary.class]) [rows addObject:@{@"text":detail[@"text"] ?: @"", @"timestamp":detail[@"timestamp"] ?: @0, @"detail":@YES}];
+        }
+        weakSelf.summaryRows = rows;
         weakSelf.stateLabel.text = error.localizedDescription ?: @"";
         weakSelf.tableView.backgroundView = summary ? nil : weakSelf.stateLabel;
         [weakSelf.tableView reloadData];
@@ -580,8 +596,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (NSInteger)numberOfSectionsInTableView:(__unused UITableView *)tableView { return self.summary ? 2 : 0; }
 - (NSInteger)tableView:(__unused UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 1;
-    NSArray *highlights = [self.summary[@"highlights"] isKindOfClass:NSArray.class] ? self.summary[@"highlights"] : @[];
-    return highlights.count;
+    return self.summaryRows.count;
 }
 - (NSString *)tableView:(__unused UITableView *)tableView titleForHeaderInSection:(NSInteger)section { return section == 0 ? @"Tóm tắt" : @"Các ý chính · chạm để tua"; }
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -593,9 +608,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         cell.textLabel.text = self.summary[@"summary"];
         cell.detailTextLabel.text = @"Chạm để sao chép";
     } else {
-        NSDictionary *item = self.summary[@"highlights"][(NSUInteger)indexPath.row];
+        NSDictionary *item = self.summaryRows[(NSUInteger)indexPath.row];
         NSTimeInterval seconds = [item[@"timestamp"] doubleValue];
-        cell.textLabel.text = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] : @"";
+        NSString *text = [item[@"text"] isKindOfClass:NSString.class] ? item[@"text"] : @"";
+        cell.textLabel.text = [item[@"detail"] boolValue] ? [@"    " stringByAppendingString:text] : text;
         cell.detailTextLabel.text = [NSString stringWithFormat:@"%02ld:%02ld", (long)(seconds / 60), (long)((NSInteger)seconds % 60)];
     }
     return cell;
@@ -605,7 +621,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         UIPasteboard.generalPasteboard.string = self.summary[@"summary"];
         return;
     }
-    NSDictionary *item = self.summary[@"highlights"][(NSUInteger)indexPath.row];
+    NSDictionary *item = self.summaryRows[(NSUInteger)indexPath.row];
     [self.player seekToTime:[item[@"timestamp"] doubleValue]];
 }
 @end
@@ -759,6 +775,14 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [stack addArrangedSubview:[self row:@"Lồng tiếng" control:self.speechSwitch]];
     self.bilingualSwitch = [UISwitch new]; self.bilingualSwitch.on = [defaults boolForKey:@"TDBilingual"];
     [stack addArrangedSubview:[self row:@"Phụ đề song ngữ" control:self.bilingualSwitch]];
+    self.captionSwitch = [UISwitch new]; self.captionSwitch.on = [defaults objectForKey:@"TDShowCaptions"] ? [defaults boolForKey:@"TDShowCaptions"] : YES;
+    [stack addArrangedSubview:[self row:@"Hiện phụ đề" control:self.captionSwitch]];
+    self.subtitleSizeSlider = [UISlider new];
+    self.subtitleSizeSlider.minimumValue = 16;
+    self.subtitleSizeSlider.maximumValue = 36;
+    self.subtitleSizeSlider.value = [defaults objectForKey:@"TDSubtitleSize"] ? [defaults floatForKey:@"TDSubtitleSize"] : 22;
+    [stack addArrangedSubview:[self label:@"Cỡ chữ phụ đề"]];
+    [stack addArrangedSubview:self.subtitleSizeSlider];
     self.muteSwitch = [UISwitch new]; self.muteSwitch.on = [defaults boolForKey:@"TDMuteOriginal"];
     [stack addArrangedSubview:[self row:@"Tắt tiếng video gốc" control:self.muteSwitch]];
     [stack addArrangedSubview:[self label:@"Giữ tiếng gốc bật mặc định. Có thể tắt nếu chỉ muốn nghe giọng lồng tiếng."]];
@@ -847,11 +871,13 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [defaults setObject:language forKey:@"TDLanguage"];
     [defaults setBool:self.speechSwitch.on forKey:@"TDSpeech"];
     [defaults setBool:self.bilingualSwitch.on forKey:@"TDBilingual"];
+    [defaults setBool:self.captionSwitch.on forKey:@"TDShowCaptions"];
+    [defaults setFloat:self.subtitleSizeSlider.value forKey:@"TDSubtitleSize"];
     [defaults setBool:self.muteSwitch.on forKey:@"TDMuteOriginal"];
     [defaults setFloat:self.speechVolumeSlider.value forKey:@"TDSpeechVolume"];
     [[TDManager shared] checkSession:^(BOOL signedIn) {
         if (!signedIn) { self.statusLabel.text = @"Đăng nhập TransDuck trước khi dịch."; return; }
-        [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on muteOriginal:self.muteSwitch.on speechVolume:self.speechVolumeSlider.value];
+        [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on showCaptions:self.captionSwitch.on subtitleSize:self.subtitleSizeSlider.value muteOriginal:self.muteSwitch.on speechVolume:self.speechVolumeSlider.value];
     }];
 }
 - (void)showSummary {
