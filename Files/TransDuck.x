@@ -58,6 +58,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) UIButton *startButton;
 @property (nonatomic, strong) UIButton *summaryButton;
 @property (nonatomic, strong) UISlider *subtitleSizeSlider;
+@property (nonatomic, strong) UIButton *captionPositionButton;
+@property (nonatomic, strong) UIButton *captionColorButton;
+@property (nonatomic, strong) UISlider *captionOpacitySlider;
+@property (nonatomic, strong) UISwitch *originalFirstSwitch;
 @end
 
 @interface TDVoicePicker : UITableViewController <UISearchResultsUpdating>
@@ -428,8 +432,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     UIView *view = self.player.playerView;
     UILabel *label = [UILabel new];
     label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.68];
-    label.textColor = UIColor.whiteColor;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    CGFloat opacity = [defaults objectForKey:@"TDCaptionOpacity"] ? [defaults floatForKey:@"TDCaptionOpacity"] : 0.68;
+    label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:MIN(0.9, MAX(0, opacity))];
+    NSString *color = [defaults stringForKey:@"TDCaptionColor"] ?: @"white";
+    NSDictionary *colors = @{@"white":UIColor.whiteColor, @"yellow":UIColor.systemYellowColor, @"cyan":UIColor.systemCyanColor, @"green":UIColor.systemGreenColor};
+    label.textColor = colors[color] ?: UIColor.whiteColor;
     label.font = [UIFont systemFontOfSize:self.subtitleSize weight:UIFontWeightSemibold];
     label.textAlignment = NSTextAlignmentCenter;
     label.numberOfLines = 3;
@@ -437,11 +445,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     label.clipsToBounds = YES;
     label.hidden = YES;
     [view addSubview:label];
-    [NSLayoutConstraint activateConstraints:@[
-        [label.centerXAnchor constraintEqualToAnchor:view.centerXAnchor],
-        [label.bottomAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.bottomAnchor constant:-46],
-        [label.widthAnchor constraintLessThanOrEqualToAnchor:view.widthAnchor multiplier:0.86]
-    ]];
+    NSString *position = [defaults stringForKey:@"TDCaptionPosition"] ?: @"bottom";
+    NSLayoutConstraint *vertical = [position isEqualToString:@"top"] ? [label.topAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.topAnchor constant:46] : ([position isEqualToString:@"middle"] ? [label.centerYAnchor constraintEqualToAnchor:view.centerYAnchor] : [label.bottomAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.bottomAnchor constant:-46]);
+    [NSLayoutConstraint activateConstraints:@[[label.centerXAnchor constraintEqualToAnchor:view.centerXAnchor], vertical, [label.widthAnchor constraintLessThanOrEqualToAnchor:view.widthAnchor multiplier:0.86]]];
     self.captionLabel = label;
     self.previousTime = -1;
     if (self.speech && self.muteOriginal && self.player.activeVideo) {
@@ -470,7 +476,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (found >= 0) {
         NSDictionary *cue = self.cues[(NSUInteger)found];
         NSString *translated = cue[@"translated"] ?: cue[@"text"];
-        NSString *display = self.bilingual && cue[@"translated"] ? [NSString stringWithFormat:@"%@\n%@", translated, cue[@"text"]] : translated;
+        BOOL originalFirst = [NSUserDefaults.standardUserDefaults boolForKey:@"TDOriginalFirst"];
+        NSString *display = self.bilingual && cue[@"translated"] ? (originalFirst ? [NSString stringWithFormat:@"%@\n%@", cue[@"text"], translated] : [NSString stringWithFormat:@"%@\n%@", translated, cue[@"text"]]) : translated;
         if (![self.captionLabel.text isEqualToString:display]) self.captionLabel.text = display;
     }
     if (!advancing) { [self.audioPlayer pause]; return; }
@@ -759,6 +766,12 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
     return label;
 }
+- (UILabel *)sectionLabel:(NSString *)text {
+    UILabel *label = [self label:text];
+    label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    label.textColor = UIColor.secondaryLabelColor;
+    return label;
+}
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"TransDuck";
@@ -781,6 +794,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [login setTitle:@"Đăng nhập TransDuck" forState:UIControlStateNormal];
     [login addTarget:self action:@selector(login) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:login];
+    [stack addArrangedSubview:[self sectionLabel:@"Bản dịch"]];
     self.modelButton = [self menuButton:@"Gemini Flash Lite" options:TDModels() action:@selector(selectModel)];
     [stack addArrangedSubview:[self row:@"Mô hình dịch" control:self.modelButton]];
     self.domainButton = [self menuButton:@"General" options:@[] action:@selector(selectDomain)];
@@ -803,6 +817,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [stack addArrangedSubview:[self row:@"Phụ đề song ngữ" control:self.bilingualSwitch]];
     self.rulesSwitch = [UISwitch new]; self.rulesSwitch.on = [defaults boolForKey:@"TDTranslationRules"];
     [stack addArrangedSubview:[self row:@"Áp dụng bảng thuật ngữ và quy tắc dịch" control:self.rulesSwitch]];
+    [stack addArrangedSubview:[self sectionLabel:@"Phụ đề"]];
     self.captionSwitch = [UISwitch new]; self.captionSwitch.on = [defaults objectForKey:@"TDShowCaptions"] ? [defaults boolForKey:@"TDShowCaptions"] : YES;
     [stack addArrangedSubview:[self row:@"Hiện phụ đề" control:self.captionSwitch]];
     self.subtitleSizeSlider = [UISlider new];
@@ -811,6 +826,24 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     self.subtitleSizeSlider.value = [defaults objectForKey:@"TDSubtitleSize"] ? [defaults floatForKey:@"TDSubtitleSize"] : 22;
     [stack addArrangedSubview:[self label:@"Cỡ chữ phụ đề"]];
     [stack addArrangedSubview:self.subtitleSizeSlider];
+    self.captionPositionButton = [self menuButton:@"Dưới" options:@[] action:@selector(selectCaptionPosition)];
+    NSArray *positions = @[@{@"name":@"Trên", @"id":@"top"}, @{@"name":@"Giữa", @"id":@"middle"}, @{@"name":@"Dưới", @"id":@"bottom"}];
+    for (NSDictionary *item in positions) if ([item[@"id"] isEqualToString:[defaults stringForKey:@"TDCaptionPosition"]]) { [self.captionPositionButton setTitle:item[@"name"] forState:UIControlStateNormal]; self.captionPositionButton.accessibilityValue = item[@"id"]; }
+    [stack addArrangedSubview:[self row:@"Vị trí phụ đề" control:self.captionPositionButton]];
+    self.captionColorButton = [self menuButton:@"Trắng" options:@[] action:@selector(selectCaptionColor)];
+    NSArray *colors = @[@{@"name":@"Trắng", @"id":@"white"}, @{@"name":@"Vàng", @"id":@"yellow"}, @{@"name":@"Xanh lam", @"id":@"cyan"}, @{@"name":@"Xanh lá", @"id":@"green"}];
+    for (NSDictionary *item in colors) if ([item[@"id"] isEqualToString:[defaults stringForKey:@"TDCaptionColor"]]) { [self.captionColorButton setTitle:item[@"name"] forState:UIControlStateNormal]; self.captionColorButton.accessibilityValue = item[@"id"]; }
+    [stack addArrangedSubview:[self row:@"Màu chữ" control:self.captionColorButton]];
+    self.captionOpacitySlider = [UISlider new];
+    self.captionOpacitySlider.minimumValue = 0;
+    self.captionOpacitySlider.maximumValue = 0.9;
+    self.captionOpacitySlider.value = [defaults objectForKey:@"TDCaptionOpacity"] ? [defaults floatForKey:@"TDCaptionOpacity"] : 0.68;
+    [stack addArrangedSubview:[self label:@"Độ mờ nền phụ đề"]];
+    [stack addArrangedSubview:self.captionOpacitySlider];
+    self.originalFirstSwitch = [UISwitch new];
+    self.originalFirstSwitch.on = [defaults boolForKey:@"TDOriginalFirst"];
+    [stack addArrangedSubview:[self row:@"Bản gốc ở trên" control:self.originalFirstSwitch]];
+    [stack addArrangedSubview:[self sectionLabel:@"Lồng tiếng"]];
     self.muteSwitch = [UISwitch new]; self.muteSwitch.on = [defaults boolForKey:@"TDMuteOriginal"];
     [stack addArrangedSubview:[self row:@"Tắt tiếng video gốc" control:self.muteSwitch]];
     [stack addArrangedSubview:[self label:@"Giữ tiếng gốc bật mặc định. Có thể tắt nếu chỉ muốn nghe giọng lồng tiếng."]];
@@ -874,6 +907,8 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 - (void)selectModel { [self choose:@"Mô hình dịch" options:TDModels() button:self.modelButton]; }
+- (void)selectCaptionPosition { [self choose:@"Vị trí phụ đề" options:@[@{@"name":@"Trên", @"id":@"top"}, @{@"name":@"Giữa", @"id":@"middle"}, @{@"name":@"Dưới", @"id":@"bottom"}] button:self.captionPositionButton]; }
+- (void)selectCaptionColor { [self choose:@"Màu chữ" options:@[@{@"name":@"Trắng", @"id":@"white"}, @{@"name":@"Vàng", @"id":@"yellow"}, @{@"name":@"Xanh lam", @"id":@"cyan"}, @{@"name":@"Xanh lá", @"id":@"green"}] button:self.captionColorButton]; }
 - (void)selectDomain { [self choose:@"Lĩnh vực dịch" options:self.domains button:self.domainButton]; }
 - (void)selectVoice {
     TDVoicePicker *picker = [TDVoicePicker new];
@@ -927,6 +962,10 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [defaults setBool:self.rulesSwitch.on forKey:@"TDTranslationRules"];
     [defaults setBool:self.captionSwitch.on forKey:@"TDShowCaptions"];
     [defaults setFloat:self.subtitleSizeSlider.value forKey:@"TDSubtitleSize"];
+    [defaults setObject:self.captionPositionButton.accessibilityValue ?: @"bottom" forKey:@"TDCaptionPosition"];
+    [defaults setObject:self.captionColorButton.accessibilityValue ?: @"white" forKey:@"TDCaptionColor"];
+    [defaults setFloat:self.captionOpacitySlider.value forKey:@"TDCaptionOpacity"];
+    [defaults setBool:self.originalFirstSwitch.on forKey:@"TDOriginalFirst"];
     [defaults setBool:self.muteSwitch.on forKey:@"TDMuteOriginal"];
     [defaults setFloat:self.speechVolumeSlider.value forKey:@"TDSpeechVolume"];
     [[TDManager shared] checkSession:^(BOOL signedIn) {
