@@ -20,13 +20,23 @@ static void TDInspectFeedCapabilities(void) {
 }
 
 @interface YTGridReflowController : NSObject
-- (id)reflowedFeedContent:(id)content withColumnCount:(NSInteger)columns andReflowOptions:(id)options;
+- (id)reflowedFeedContent:(id)content withColumnCount:(NSUInteger)columns andReflowOptions:(id)options;
+@end
+@interface YTColdConfigFeedsSystemClientImpl : NSObject
+- (BOOL)iosDisableResponsiveGridsInPortraitOnHome;
 @end
 
+%hook YTColdConfigFeedsSystemClientImpl
+- (BOOL)iosDisableResponsiveGridsInPortraitOnHome {
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) return NO;
+    return %orig;
+}
+%end
+
 %hook YTGridReflowController
-- (id)reflowedFeedContent:(id)content withColumnCount:(NSInteger)columns andReflowOptions:(id)options {
-    NSInteger desired = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && columns == 1 ? 2 : columns;
-    if (desired != columns) os_log(OS_LOG_DEFAULT, "[TransDuckFeedGrid] reflow %ld to %ld columns", (long)columns, (long)desired);
+- (id)reflowedFeedContent:(id)content withColumnCount:(NSUInteger)columns andReflowOptions:(id)options {
+    NSUInteger desired = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && columns == 1 ? 2 : columns;
+    if (desired != columns) os_log(OS_LOG_DEFAULT, "[TransDuckFeedGrid] reflow %lu to %lu columns", (unsigned long)columns, (unsigned long)desired);
     return %orig(content, desired, options);
 }
 %end

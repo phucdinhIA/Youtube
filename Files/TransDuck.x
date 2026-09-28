@@ -892,6 +892,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if (![self.captionLabel.text isEqualToString:display]) self.captionLabel.text = display;
     }
     if (!advancing) { [self.audioPlayer pause]; return; }
+    if (self.audioPlayer && !self.audioPlayer.isPlaying && self.audioPlayer.currentTime >= self.audioPlayer.duration - 0.05) self.audioFinished = YES;
     // A synthesized phrase can be longer than its caption interval. Let it
     // finish, then play the next phrase instead of cutting off the last words.
     if (self.audioPlayer && found != self.activeIndex && !jumped && !self.audioFinished) {
