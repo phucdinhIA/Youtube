@@ -19,7 +19,9 @@ static CGFloat TDPlaybackRate(YTPlayerViewController *player) {
 static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, NSDictionary *nextCue, CGFloat videoTime, CGFloat playbackRate) {
     CGFloat deadline = [cue[@"end"] doubleValue];
     CGFloat nextStart = [nextCue[@"start"] doubleValue];
-    if (nextCue && nextStart > [cue[@"start"] doubleValue] && nextStart <= deadline + 0.35)
+    // Overlapping captions can be voiced together, so do not compress the
+    // current phrase merely to finish before the next one starts.
+    if (nextCue && nextStart >= deadline - 0.2 && nextStart <= deadline + 0.35)
         deadline = nextStart;
     CGFloat remainingVideo = deadline - videoTime;
     CGFloat remainingSpeech = audio.duration - audio.currentTime;
@@ -185,7 +187,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) NSArray<NSNumber *> *prefixMaxEnd;
 @property (nonatomic, strong) NSCache<NSString *, NSData *> *audioCache;
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
-@property (nonatomic, strong) AVAudioPlayer *tailAudioPlayer;
+@property (nonatomic, strong) NSMutableArray<AVAudioPlayer *> *overlapAudioPlayers;
 @property (nonatomic, strong) AVAudioPlayer *preparedAudioPlayer;
 @property (nonatomic) NSInteger preparedAudioIndex;
 @property (nonatomic) NSInteger preparingAudioIndex;
@@ -293,6 +295,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         _audioCache = [NSCache new];
         _audioCache.totalCostLimit = 24 * 1024 * 1024;
         _downloads = [NSMutableSet set];
+        _overlapAudioPlayers = [NSMutableArray array];
         _activeIndex = -1;
         _preparedAudioIndex = -1;
         _preparingAudioIndex = -1;
@@ -360,9 +363,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.timer invalidate];
     self.timer = nil;
     [self.audioPlayer stop];
-    [self.tailAudioPlayer stop];
+    for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio stop];
+    [self.overlapAudioPlayers removeAllObjects];
     self.audioPlayer = nil;
-    self.tailAudioPlayer = nil;
     self.preparedAudioPlayer = nil;
     self.preparedAudioIndex = -1;
     self.preparingAudioIndex = -1;
@@ -760,8 +763,24 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         return;
     }
     NSMutableArray *subtitles = [NSMutableArray array];
-    for (NSDictionary *cue in batch) {
-        [subtitles addObject:@{@"index":cue[@"index"], @"text":cue[@"text"], @"googleTranslation":cue[@"text"], @"start":cue[@"start"], @"end":cue[@"end"]}];
+    for (NSUInteger i = 0; i < batch.count; i++) {
+        NSUInteger index = offset + i;
+        NSDictionary *cue = batch[i];
+        NSMutableDictionary *item = [@{@"index":cue[@"index"], @"text":cue[@"text"],
+            @"googleTranslation":@"", @"start":cue[@"start"], @"end":cue[@"end"]} mutableCopy];
+        NSMutableArray *before = [NSMutableArray array];
+        for (NSUInteger j = index > 3 ? index - 3 : 0; j < index; j++) {
+            NSDictionary *previous = self.cues[j];
+            NSMutableDictionary *context = [@{@"text":previous[@"text"]} mutableCopy];
+            if ([previous[@"translated"] isKindOfClass:NSString.class]) context[@"translation"] = previous[@"translated"];
+            [before addObject:context];
+        }
+        NSMutableArray *after = [NSMutableArray array];
+        for (NSUInteger j = index + 1; j < MIN(self.cues.count, index + 3); j++)
+            [after addObject:@{@"text":self.cues[j][@"text"]}];
+        if (before.count) item[@"contextBefore"] = before;
+        if (after.count) item[@"contextAfter"] = after;
+        [subtitles addObject:item];
     }
     NSDictionary *body = @{@"videoId":self.videoID, @"title":self.videoID, @"model":self.model, @"toLanguage":self.targetLanguage, @"domain":self.domain ?: @"general", @"translationRulesEnabled":@(self.translationRulesEnabled), @"skipTranslation":@NO, @"subtitles":subtitles};
     [self request:@"/api/v2/ai-translate/translate" method:@"POST" body:body completion:^(id json, NSError *error) {
@@ -1084,7 +1103,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.captionLabel.hidden = YES;
         if (self.audioPlayer.isPlaying) self.audioPausedForVideo = YES;
         [self.audioPlayer pause];
-        [self.tailAudioPlayer pause];
+        for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio pause];
         self.previousTime = -1;
         self.previousTickWallTime = 0;
         return;
@@ -1096,7 +1115,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.captionLabel.hidden = YES;
         if (self.audioPlayer.isPlaying) self.audioPausedForVideo = YES;
         [self.audioPlayer pause];
-        [self.tailAudioPlayer pause];
+        for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio pause];
         self.previousTime = -1;
         self.previousTickWallTime = 0;
         return;
@@ -1136,9 +1155,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }
     if (jumped && !self.preparing) {
         [self.audioPlayer stop];
-        [self.tailAudioPlayer stop];
+        for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio stop];
+        [self.overlapAudioPlayers removeAllObjects];
         self.audioPlayer = nil;
-        self.tailAudioPlayer = nil;
         self.preparedAudioPlayer = nil;
         self.preparedAudioIndex = -1;
         self.preparingAudioIndex = -1;
@@ -1165,9 +1184,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.bufferedSequentialCue = !jumped && speechTarget != found;
         self.resumeAfterSeek = player.playerState == 3;
         [self.audioPlayer stop];
-        [self.tailAudioPlayer stop];
+        for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio stop];
+        [self.overlapAudioPlayers removeAllObjects];
         self.audioPlayer = nil;
-        self.tailAudioPlayer = nil;
         self.preparedAudioPlayer = nil;
         self.preparedAudioIndex = -1;
         self.preparingAudioIndex = -1;
@@ -1203,9 +1222,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (!advancing || player.playerState != 3) {
         if (self.audioPlayer.isPlaying) self.audioPausedForVideo = YES;
         [self.audioPlayer pause];
-        [self.tailAudioPlayer stop];
-        self.tailAudioPlayer = nil;
+        for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio pause];
         return;
+    }
+    if (self.audioPausedForVideo && (!self.audioPlayer || self.audioFinished)) {
+        for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio play];
+        self.audioPausedForVideo = NO;
     }
     // Keep the current phrase until it ends. Never rewind a playing phrase:
     // caption intervals can be much shorter than their synthesized audio.
@@ -1217,6 +1239,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if (!self.audioPlayer.isPlaying) {
             if (self.audioPausedForVideo || !self.audioHasStarted) {
                 self.audioHasStarted = [self.audioPlayer play];
+                if (self.audioHasStarted) for (AVAudioPlayer *audio in self.overlapAudioPlayers) [audio play];
                 self.audioPausedForVideo = NO;
             }
             if (!self.audioHasStarted) return;
@@ -1229,9 +1252,14 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             self.audioPlayer.isPlaying) {
             CGFloat remaining = (self.audioPlayer.duration - self.audioPlayer.currentTime) /
                 MAX(0.5, self.audioPlayer.rate);
+            NSDictionary *activeCue = self.cues[(NSUInteger)self.activeIndex];
+            CGFloat nextStart = [self.cues[(NSUInteger)upcoming][@"start"] doubleValue];
+            CGFloat activeEnd = [activeCue[@"end"] doubleValue];
+            BOOL captionOverlap = nextStart < activeEnd - 0.2 && time <= activeEnd + 0.1;
             // AVAudioPlayer can reset currentTime to zero as playback ends.
-            // Capture the tail while it is still playing; never fade a whole phrase.
-            if (remaining > 0 && remaining <= 0.08) {
+            // Concurrent caption cues may speak together, as in the extension.
+            // For non-overlapping cues, join only at the final audio tail.
+            if (captionOverlap || (remaining > 0 && remaining <= 0.08)) {
                 AVAudioPlayer *nextAudio = self.preparedAudioPlayer;
                 AVAudioPlayer *previousAudio = self.audioPlayer;
                 self.preparedAudioPlayer = nil;
@@ -1246,8 +1274,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
                 nextAudio.volume = 0;
                 nextAudio.delegate = self;
                 if ([nextAudio play]) {
-                    [self.tailAudioPlayer stop];
-                    self.tailAudioPlayer = previousAudio;
+                    [self.overlapAudioPlayers addObject:previousAudio];
                     self.audioPlayer = nextAudio;
                     self.activeIndex = upcoming;
                     self.activeVoiceStretch = stretch;
@@ -1255,7 +1282,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
                     self.audioHasStarted = YES;
                     self.audioPausedForVideo = NO;
                     [nextAudio setVolume:self.speechVolume fadeDuration:0.08];
-                    os_log(OS_LOG_DEFAULT, "[TransDuckVoice] crossfade cue=%ld overlap=%.2f rate=%.2f", (long)upcoming, remaining, nextAudio.rate);
+                    os_log(OS_LOG_DEFAULT, "[TransDuckVoice] blend cue=%ld captionOverlap=%d audioRemaining=%.2f late=%.2f rate=%.2f", (long)upcoming, captionOverlap, remaining, MAX(0, time - nextStart), nextAudio.rate);
                     [self prefetchNearIndex:upcoming];
                     [self prepareUpcomingAudio];
                 }
@@ -1408,7 +1435,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self prepareUpcomingAudio];
 }
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
-    if (player == self.tailAudioPlayer) { self.tailAudioPlayer = nil; return; }
+    if ([self.overlapAudioPlayers containsObject:player]) {
+        [self.overlapAudioPlayers removeObject:player];
+        return;
+    }
     if (player != self.audioPlayer) return;
     self.audioFinished = YES;
     os_log(OS_LOG_DEFAULT, "[TransDuckVoice] finished cue=%ld success=%d", (long)self.activeIndex, flag);
@@ -1892,6 +1922,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     TDManager *manager = [TDManager shared];
     manager.speechVolume = self.speechVolumeSlider.value;
     manager.audioPlayer.volume = manager.speechVolume;
+    for (AVAudioPlayer *audio in manager.overlapAudioPlayers) audio.volume = manager.speechVolume;
     os_log(OS_LOG_DEFAULT, "[TransDuckVoice] slider=%.2f active=%d", manager.speechVolume, manager.audioPlayer != nil);
 }
 - (void)originalVolumeChanged {
