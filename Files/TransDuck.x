@@ -15,10 +15,12 @@ static CGFloat TDPlaybackRate(YTPlayerViewController *player) {
     CGFloat rate = [(YTMainAppVideoPlayerOverlayViewController *)overlay currentPlaybackRate];
     return isfinite(rate) && rate > 0 ? MIN(2, MAX(0.5, rate)) : 1;
 }
-static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, CGFloat playbackRate) {
-    CGFloat cueDuration = [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue];
-    if (!isfinite(cueDuration) || cueDuration <= 0 || !isfinite(audio.duration)) return 1;
-    return MIN(MAX(1, audio.duration / cueDuration), 2 / MAX(0.5, playbackRate));
+static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, CGFloat videoTime, CGFloat playbackRate) {
+    CGFloat remainingVideo = [cue[@"end"] doubleValue] - videoTime;
+    CGFloat remainingSpeech = audio.duration - audio.currentTime;
+    if (!isfinite(remainingVideo) || !isfinite(remainingSpeech) || remainingVideo <= 0 || remainingSpeech <= 0) return 1;
+    // Catch up when a voice starts late without repeatedly pausing the video.
+    return MIN(MAX(1, remainingSpeech / remainingVideo), 1.6 / MAX(0.5, playbackRate));
 }
 static AVPlayer *TDPlayerInLayer(CALayer *layer) {
     if ([layer isKindOfClass:AVPlayerLayer.class] && ((AVPlayerLayer *)layer).player) return ((AVPlayerLayer *)layer).player;
@@ -175,8 +177,6 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) NSCache<NSString *, NSData *> *audioCache;
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
 @property (nonatomic) BOOL audioFinished;
-@property (nonatomic) BOOL holdingForSpeech;
-@property (nonatomic) BOOL resumeAfterSpeech;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) UILabel *captionLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *playerActivity;
@@ -327,8 +327,6 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.audioPlayer stop];
     self.audioPlayer = nil;
     self.audioFinished = NO;
-    self.holdingForSpeech = NO;
-    self.resumeAfterSpeech = NO;
     [self.playerActivity stopAnimating];
     [self.playerActivity removeFromSuperview];
     self.playerActivity = nil;
@@ -871,8 +869,6 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         [self.audioPlayer stop];
         self.audioPlayer = nil;
         self.audioFinished = NO;
-        self.holdingForSpeech = NO;
-        self.resumeAfterSpeech = NO;
         self.activeIndex = -1;
     }
     if (self.preparing) {
@@ -886,9 +882,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (needsBuffer && !self.bufferingSeek) {
         self.bufferingSeek = YES;
         self.bufferedCueIndex = target;
-        self.resumeAfterSeek = self.holdingForSpeech ? self.resumeAfterSpeech : player.playerState == 3;
-        self.holdingForSpeech = NO;
-        self.resumeAfterSpeech = NO;
+        self.resumeAfterSeek = player.playerState == 3;
         [self.audioPlayer stop];
         self.audioPlayer = nil;
         self.audioFinished = NO;
@@ -917,34 +911,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSString *display = self.bilingual && cue[@"translated"] ? (originalFirst ? [NSString stringWithFormat:@"%@\n%@", cue[@"text"], translated] : [NSString stringWithFormat:@"%@\n%@", translated, cue[@"text"]]) : translated;
         if (![self.captionLabel.text isEqualToString:display]) self.captionLabel.text = display;
     }
-    if (self.holdingForSpeech) {
-        if (self.audioFinished || !self.audioPlayer) {
-            self.holdingForSpeech = NO;
-            BOOL resume = self.resumeAfterSpeech;
-            self.resumeAfterSpeech = NO;
-            self.previousTime = -1;
-            if (resume) [player play];
-            return;
-        }
-        if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
-        return;
-    }
-    // When one phrase outlasts its caption, hold the picture at the next
-    // phrase rather than losing the intervening narration.
-    if (self.audioPlayer && !self.audioFinished && found > self.activeIndex && !jumped && player.playerState == 3) {
-        self.holdingForSpeech = YES;
-        self.resumeAfterSpeech = YES;
-        [player pause];
-        os_log(OS_LOG_DEFAULT, "[TransDuckVoice] hold cue=%ld next=%ld remaining=%.2f", (long)self.activeIndex, (long)found, self.audioPlayer.duration - self.audioPlayer.currentTime);
-        return;
-    }
     if (!advancing || player.playerState != 3) { [self.audioPlayer pause]; return; }
     // Keep the current phrase until it ends. Never rewind a playing phrase:
     // caption intervals can be much shorter than their synthesized audio.
     if (self.audioPlayer && !self.audioFinished) {
         NSDictionary *cue = self.cues[(NSUInteger)self.activeIndex];
         CGFloat playbackRate = TDPlaybackRate(player);
-        CGFloat stretch = TDSpeechStretch(self.audioPlayer, cue, playbackRate);
+        CGFloat stretch = TDSpeechStretch(self.audioPlayer, cue, time, playbackRate);
         self.audioPlayer.rate = stretch * playbackRate;
         if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
         return;
@@ -1011,7 +984,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             NSDictionary *cue = self.cues[(NSUInteger)index];
             if (now < [cue[@"start"] doubleValue]) return;
             CGFloat playbackRate = TDPlaybackRate(self.player);
-            CGFloat stretch = TDSpeechStretch(audio, cue, playbackRate);
+            CGFloat stretch = TDSpeechStretch(audio, cue, now, playbackRate);
             // Play complete speech even when decoding or a network response
             // arrives after the caption begins. Seeking resets activeIndex.
             audio.currentTime = 0;
