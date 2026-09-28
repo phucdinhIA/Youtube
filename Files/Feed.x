@@ -9,8 +9,9 @@
     while (views.count) {
         UIView *view = views.lastObject;
         [views removeLastObject];
-        if ([view isKindOfClass:ASCollectionView.class]) {
-            ASCollectionView *collection = (ASCollectionView *)view;
+        Class collectionClass = NSClassFromString(@"ASCollectionView");
+        if (collectionClass && [view isKindOfClass:collectionClass]) {
+            UICollectionView *collection = (UICollectionView *)view;
             NSLog(@"[TransDuckFeed] controller=%@ width=%.0f layout=%@ sections=%ld", NSStringFromClass(self.class), collection.bounds.size.width, NSStringFromClass(collection.collectionViewLayout.class), (long)[collection numberOfSections]);
         }
         [views addObjectsFromArray:view.subviews];
