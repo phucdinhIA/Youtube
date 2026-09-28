@@ -848,6 +848,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     NSMutableDictionary *cue = self.cues[index];
     if (silent) {
         cue[@"silentVoice"] = @YES;
+        [cue removeObjectForKey:@"audioURL"];
         os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] voice unavailable cue=%lu start=%.2f", (unsigned long)index, [cue[@"start"] doubleValue]);
     }
     [cue removeObjectForKey:@"recoveringVoice"];
@@ -877,8 +878,26 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (generation != self.generation || index >= self.cues.count || !self.speech) return;
     NSMutableDictionary *cue = self.cues[index];
     if ([cue[@"recoveringVoice"] boolValue]) return;
+    NSUInteger attempt = [cue[@"audioRecoveryAttempts"] unsignedIntegerValue] + 1;
+    if (attempt > 2) {
+        [self finishSpeechCueAtIndex:index silent:YES];
+        if (index == self.initialCueIndex) [self releaseInitialBuffer];
+        [self releaseSeekBufferIfReady];
+        [self synthesizeAvailable:generation];
+        return;
+    }
+    cue[@"audioRecoveryAttempts"] = @(attempt);
     cue[@"recoveringVoice"] = @YES;
+    NSString *oldURL = cue[@"audioURL"];
+    if (oldURL.length) {
+        [self.audioCache removeObjectForKey:oldURL];
+        [self.audioDownloadRetries removeObjectForKey:oldURL];
+    }
     [cue removeObjectForKey:@"audioURL"];
+    if (attempt == 2 && [self.targetLanguage.lowercaseString hasPrefix:@"vi"]) {
+        cue[@"ttsVoice"] = [self.voice isEqualToString:@"vi-VN-HoaiMyNeural"] ? @"vi-VN-NamMinhNeural" : @"vi-VN-HoaiMyNeural";
+        cue[@"fallbackVoice"] = @YES;
+    }
     [self.speechRanges insertObject:[NSValue valueWithRange:NSMakeRange(index, 1)] atIndex:0];
     os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] regenerate expired audio cue=%lu", (unsigned long)index);
     [self synthesizeAvailable:generation];
@@ -1211,6 +1230,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             self.audioPlayer = audio;
             self.audioFinished = NO;
             BOOL started = self.advancing && self.player.playerState == 3 && [audio play];
+            if (started) [self.cues[(NSUInteger)index] removeObjectForKey:@"audioRecoveryAttempts"];
             os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], audio.volume, started);
         });
     });
