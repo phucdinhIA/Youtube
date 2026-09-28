@@ -6,6 +6,12 @@ extern void TDShowTranslationPreferences(UINavigationController *navigation, NSS
 
 // All player and UI state stays on the main queue. Network callbacks return there.
 static NSString *const TDBaseURL = @"https://yd.transduck.com";
+static CGFloat TDPlaybackRate(YTPlayerViewController *player) {
+    id overlay = player.activeVideoPlayerOverlay;
+    if (![overlay respondsToSelector:@selector(currentPlaybackRate)]) return 1;
+    CGFloat rate = [(YTMainAppVideoPlayerOverlayViewController *)overlay currentPlaybackRate];
+    return isfinite(rate) && rate > 0 ? MIN(2, MAX(0.5, rate)) : 1;
+}
 static NSArray<NSDictionary *> *TDModels(void) {
     return @[
         @{ @"name": @"Google", @"id": @"google" },
@@ -90,6 +96,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, weak) YTPlayerViewController *player;
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *cues;
+@property (nonatomic, strong) NSArray<NSNumber *> *prefixMaxEnd;
 @property (nonatomic, strong) NSCache<NSString *, NSData *> *audioCache;
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
 @property (nonatomic, strong) NSTimer *timer;
@@ -113,6 +120,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) BOOL muteOriginal;
 @property (nonatomic) BOOL originalMuted;
 @property (nonatomic) BOOL originalMuteCaptured;
+@property (nonatomic, weak) YTSingleVideoController *mutedVideo;
 @property (nonatomic) BOOL preparing;
 @property (nonatomic) float speechVolume;
 @property (nonatomic) NSUInteger translatedCount;
@@ -130,6 +138,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)fetchCaptionsForVideo:(NSString *)videoID completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion;
 - (void)saveSubtitle:(NSString *)srt videoID:(NSString *)videoID completion:(void (^)(NSError *))completion;
 - (void)fetchDomains:(void (^)(NSArray<NSDictionary *> *))completion;
+- (void)attachCaptionToPlayerView;
 @end
 
 @implementation TDManager
@@ -210,11 +219,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.timer = nil;
     [self.audioPlayer stop];
     self.audioPlayer = nil;
-    if (self.originalMuteCaptured && self.player.activeVideo) [self.player.activeVideo setMuted:self.originalMuted];
+    if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
     self.originalMuteCaptured = NO;
+    self.mutedVideo = nil;
     [self.captionLabel removeFromSuperview];
     self.captionLabel = nil;
     self.cues = nil;
+    self.prefixMaxEnd = nil;
     [self.downloads removeAllObjects];
     self.activeIndex = -1;
     self.preparing = NO;
@@ -256,6 +267,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if (generation != self.generation) return;
         if (error || !cues.count) { [self fail:error.localizedDescription ?: @"Video chưa có phụ đề khả dụng trên TransDuck." generation:generation]; return; }
         self.cues = [cues mutableCopy];
+        NSMutableArray<NSNumber *> *maxEnds = [NSMutableArray arrayWithCapacity:cues.count];
+        double latestEnd = 0;
+        for (NSDictionary *cue in cues) {
+            latestEnd = MAX(latestEnd, [cue[@"end"] doubleValue]);
+            [maxEnds addObject:@(latestEnd)];
+        }
+        self.prefixMaxEnd = maxEnds;
         self.status = [NSString stringWithFormat:@"Đang dịch %lu câu…", (unsigned long)cues.count];
         [self translateFrom:0 generation:generation];
     }];
@@ -288,7 +306,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSDictionary *timing = item[@"$"];
         NSString *text = item[@"_"];
         double start = [timing[@"start"] doubleValue], duration = [timing[@"dur"] doubleValue];
-        if (![text isKindOfClass:NSString.class] || !text.length || duration <= 0 || start < 0) continue;
+        if (![text isKindOfClass:NSString.class] || !text.length || !isfinite(start) || !isfinite(duration) || duration <= 0 || start < 0 || !isfinite(start + duration)) continue;
         [cues addObject:[@{@"text":text, @"start":@(start), @"end":@(start + duration)} mutableCopy]];
     }
     [cues sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"start"] compare:b[@"start"]]; }];
@@ -407,8 +425,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.synthesisInFlight = NO;
         if (error || results.count != batch.count) {
             self.speech = NO;
-            if (self.originalMuteCaptured && self.player.activeVideo) [self.player.activeVideo setMuted:self.originalMuted];
+            if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
             self.originalMuteCaptured = NO;
+            self.mutedVideo = nil;
             [self finishIfReady];
             self.status = error.localizedDescription ?: @"TTS không đầy đủ; phụ đề vẫn hoạt động.";
             return;
@@ -428,8 +447,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }];
 }
 - (void)beginPlayback:(NSUInteger)generation {
-    if (generation != self.generation || !self.player.playerView) return;
-    UIView *view = self.player.playerView;
+    if (generation != self.generation) return;
     UILabel *label = [UILabel new];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
@@ -444,33 +462,53 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     label.layer.cornerRadius = 8;
     label.clipsToBounds = YES;
     label.hidden = YES;
+    self.captionLabel = label;
+    [self attachCaptionToPlayerView];
+    self.previousTime = -1;
+    if (self.speech && self.muteOriginal && self.player.activeVideo) {
+        self.mutedVideo = self.player.activeVideo;
+        self.originalMuted = self.mutedVideo.isMuted;
+        self.originalMuteCaptured = YES;
+        [self.mutedVideo setMuted:YES];
+    }
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.15 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+- (void)attachCaptionToPlayerView {
+    UIView *view = self.player.playerView;
+    UILabel *label = self.captionLabel;
+    if (!view || !label || label.superview == view) return;
+    [label removeFromSuperview];
     [view addSubview:label];
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *position = [defaults stringForKey:@"TDCaptionPosition"] ?: @"bottom";
     NSLayoutConstraint *vertical = [position isEqualToString:@"top"] ? [label.topAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.topAnchor constant:46] : ([position isEqualToString:@"middle"] ? [label.centerYAnchor constraintEqualToAnchor:view.centerYAnchor] : [label.bottomAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.bottomAnchor constant:-46]);
     [NSLayoutConstraint activateConstraints:@[[label.centerXAnchor constraintEqualToAnchor:view.centerXAnchor], vertical, [label.widthAnchor constraintLessThanOrEqualToAnchor:view.widthAnchor multiplier:0.86]]];
-    self.captionLabel = label;
-    self.previousTime = -1;
-    if (self.speech && self.muteOriginal && self.player.activeVideo) {
-        self.originalMuted = self.player.activeVideo.isMuted;
-        self.originalMuteCaptured = YES;
-        [self.player.activeVideo setMuted:YES];
-    }
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.15 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
 - (void)tick {
     YTPlayerViewController *player = self.player;
     if (!player || ![player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    [self attachCaptionToPlayerView];
     CGFloat time = player.currentVideoMediaTime;
+    if (player.isPlayingAd || !isfinite(time) || time < 0) {
+        self.captionLabel.hidden = YES;
+        [self.audioPlayer pause];
+        self.previousTime = -1;
+        return;
+    }
     BOOL advancing = self.previousTime < 0 || fabs(time - self.previousTime) > 0.015;
     self.advancing = advancing;
     self.previousTime = time;
-    NSInteger low = 0, high = (NSInteger)self.cues.count - 1, found = -1;
-    while (low <= high) {
+    // Find the latest cue that has started, then inspect only cues whose
+    // prefix contains an interval that might still cover this time.
+    NSInteger low = 0, high = (NSInteger)self.cues.count;
+    while (low < high) {
         NSInteger middle = low + (high - low) / 2;
-        NSDictionary *cue = self.cues[(NSUInteger)middle];
-        if (time < [cue[@"start"] doubleValue]) high = middle - 1;
-        else if (time >= [cue[@"end"] doubleValue]) low = middle + 1;
-        else { found = middle; break; }
+        if ([self.cues[(NSUInteger)middle][@"start"] doubleValue] <= time) low = middle + 1;
+        else high = middle;
+    }
+    NSInteger next = low, found = -1;
+    for (NSInteger i = next - 1; i >= 0 && [self.prefixMaxEnd[(NSUInteger)i] doubleValue] > time; i--) {
+        if ([self.cues[(NSUInteger)i][@"end"] doubleValue] > time) { found = i; break; }
     }
     self.captionLabel.hidden = !self.showCaptions || found < 0;
     if (found >= 0) {
@@ -482,11 +520,11 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }
     if (!advancing) { [self.audioPlayer pause]; return; }
     if (found == self.activeIndex) {
+        if (found < 0) [self prefetchNearIndex:next];
         if (self.audioPlayer && found >= 0) {
             CGFloat offset = MAX(0, time - [self.cues[(NSUInteger)found][@"start"] doubleValue]);
             if (fabs(self.audioPlayer.currentTime - offset) > 0.4) self.audioPlayer.currentTime = MIN(offset, self.audioPlayer.duration);
-            CGFloat rate = [(YTMainAppVideoPlayerOverlayViewController *)player.activeVideoPlayerOverlay currentPlaybackRate];
-            self.audioPlayer.rate = MIN(2, MAX(0.5, rate > 0 ? rate : 1));
+            self.audioPlayer.rate = TDPlaybackRate(player);
             if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
         }
         return;
@@ -494,7 +532,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.audioPlayer stop];
     self.audioPlayer = nil;
     self.activeIndex = found;
-    [self prefetchNearIndex:MAX(0, found)];
+    [self prefetchNearIndex:found >= 0 ? found : next];
     if (found < 0 || !self.speech) return;
     NSString *urlString = self.cues[(NSUInteger)found][@"audioURL"];
     if (!urlString) return;
@@ -539,8 +577,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             NSDictionary *cue = self.cues[(NSUInteger)index];
             if (now < [cue[@"start"] doubleValue] || now >= [cue[@"end"] doubleValue]) return;
             audio.currentTime = MIN(MAX(0, now - [cue[@"start"] doubleValue]), audio.duration);
-            CGFloat rate = [(YTMainAppVideoPlayerOverlayViewController *)self.player.activeVideoPlayerOverlay currentPlaybackRate];
-            audio.rate = MIN(2, MAX(0.5, rate > 0 ? rate : 1));
+            audio.rate = TDPlaybackRate(self.player);
             audio.volume = self.speechVolume;
             self.audioPlayer = audio;
             if (self.advancing) [audio play];
