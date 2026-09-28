@@ -193,6 +193,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) NSInteger activeIndex;
 @property (nonatomic) CGFloat previousTime;
 @property (nonatomic) NSInteger lastCaptionDiagnosticSecond;
+@property (nonatomic) CFTimeInterval videoIDUnavailableSince;
 @property (nonatomic) BOOL advancing;
 @property (nonatomic) BOOL speech;
 @property (nonatomic) BOOL bilingual;
@@ -226,6 +227,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) NSMutableSet<NSString *> *downloads;
 @property (nonatomic, strong) NSMutableArray<NSValue *> *translationRanges;
 @property (nonatomic, strong) NSMutableArray<NSValue *> *speechRanges;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *translationRetries;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *speechRetries;
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
 - (void)checkSession:(void (^)(BOOL))completion;
@@ -246,6 +249,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (BOOL)cueReadyAtIndex:(NSInteger)index;
 - (void)showPlayerActivity:(BOOL)show;
 - (void)releaseSeekBufferIfReady;
+- (BOOL)stopIfVideoChangedAtStage:(const char *)stage;
+- (BOOL)retryRange:(NSRange)range generation:(NSUInteger)generation speech:(BOOL)speech error:(NSError *)error;
+- (void)synthesizeAvailable:(NSUInteger)generation;
 @end
 
 @implementation TDManager
@@ -323,6 +329,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)stop {
     YTPlayerViewController *resumePlayer = self.player;
     NSString *resumeVideoID = self.videoID;
+    if (resumeVideoID.length) os_log(OS_LOG_DEFAULT, "[TransDuckLifecycle] stop video=%{public}s current=%{public}s time=%.2f translated=%lu/%lu synthesized=%lu", resumeVideoID.UTF8String, (resumePlayer.currentVideoID ?: @"").UTF8String, resumePlayer.currentVideoMediaTime, (unsigned long)self.translatedCount, (unsigned long)self.cues.count, (unsigned long)self.synthesizedCount);
     BOOL resume = self.resumeAfterPrepare || self.resumeAfterSeek;
     self.resumeAfterPrepare = NO;
     self.generation++;
@@ -352,12 +359,15 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.downloads removeAllObjects];
     self.activeIndex = -1;
     self.lastCaptionDiagnosticSecond = -1;
+    self.videoIDUnavailableSince = 0;
     self.preparing = NO;
     self.translatedCount = 0;
     self.synthesizedCount = 0;
     self.translationInFlight = 0;
     self.translationComplete = NO;
     self.synthesisInFlight = 0;
+    self.translationRetries = nil;
+    self.speechRetries = nil;
     self.startedPlayback = NO;
     self.initialCueIndex = 0;
     self.videoID = nil;
@@ -367,10 +377,55 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)fail:(NSString *)message generation:(NSUInteger)generation {
     if (generation != self.generation) return;
+    os_log(OS_LOG_DEFAULT, "[TransDuckLifecycle] fail video=%{public}s message=%{public}s", (self.videoID ?: @"").UTF8String, message.UTF8String);
     self.resumeAfterPrepare = NO;
     self.resumeAfterSeek = NO;
     [self stop];
     self.status = message;
+}
+- (BOOL)stopIfVideoChangedAtStage:(const char *)stage {
+    YTPlayerViewController *player = self.player;
+    NSString *currentID = player.currentVideoID;
+    if (!player || (currentID.length && ![currentID isEqualToString:self.videoID])) {
+        os_log(OS_LOG_DEFAULT, "[TransDuckLifecycle] player changed stage=%{public}s expected=%{public}s current=%{public}s", stage, (self.videoID ?: @"").UTF8String, (currentID ?: @"").UTF8String);
+        [self stop];
+        return YES;
+    }
+    if (!currentID.length) {
+        CFTimeInterval now = CACurrentMediaTime();
+        if (!self.videoIDUnavailableSince) {
+            self.videoIDUnavailableSince = now;
+            os_log(OS_LOG_DEFAULT, "[TransDuckLifecycle] video ID temporarily unavailable stage=%{public}s", stage);
+        } else if (now - self.videoIDUnavailableSince > 5) {
+            os_log(OS_LOG_DEFAULT, "[TransDuckLifecycle] video ID unavailable for 5 seconds stage=%{public}s", stage);
+            [self stop];
+            return YES;
+        }
+    } else if (self.videoIDUnavailableSince) {
+        os_log(OS_LOG_DEFAULT, "[TransDuckLifecycle] video ID restored stage=%{public}s", stage);
+        self.videoIDUnavailableSince = 0;
+    }
+    return NO;
+}
+- (BOOL)retryRange:(NSRange)range generation:(NSUInteger)generation speech:(BOOL)speech error:(NSError *)error {
+    if (generation != self.generation) return YES;
+    NSInteger code = error.code;
+    if (error && [error.domain isEqualToString:@"TransDuck"] && code >= 400 && code < 500 && code != 408 && code != 429) return NO;
+    NSMutableDictionary<NSNumber *, NSNumber *> *retries = speech ? self.speechRetries : self.translationRetries;
+    NSNumber *key = @(range.location);
+    NSUInteger attempt = [retries[key] unsignedIntegerValue] + 1;
+    if (attempt > 3) return NO;
+    retries[key] = @(attempt);
+    NSMutableArray<NSValue *> *ranges = speech ? self.speechRanges : self.translationRanges;
+    [ranges insertObject:[NSValue valueWithRange:range] atIndex:0];
+    os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] retry stage=%{public}s offset=%lu count=%lu attempt=%lu code=%ld", speech ? "tts" : "translation", (unsigned long)range.location, (unsigned long)range.length, (unsigned long)attempt, (long)code);
+    self.status = speech ? @"Đang thử lại tạo giọng…" : @"Đang thử lại dịch phụ đề…";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MIN(3.0, 0.75 * (1 << (attempt - 1))) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != self.generation) return;
+        if (speech) [self synthesizeAvailable:generation];
+        else [self translateNext:generation];
+    });
+    return YES;
 }
 - (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage domain:(NSString *)domain speech:(BOOL)speech bilingual:(BOOL)bilingual showCaptions:(BOOL)showCaptions subtitleSize:(float)subtitleSize translationRulesEnabled:(BOOL)translationRulesEnabled muteOriginal:(BOOL)muteOriginal originalVolume:(float)originalVolume speechVolume:(float)speechVolume resumeAfterPrepare:(BOOL)resumeAfterPrepare {
     self.resumeAfterPrepare = NO;
@@ -398,12 +453,14 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.translationRulesEnabled = translationRulesEnabled;
     self.muteOriginal = muteOriginal;
     self.preparing = YES;
+    self.translationRetries = [NSMutableDictionary dictionary];
+    self.speechRetries = [NSMutableDictionary dictionary];
     [self showPlayerActivity:YES];
     NSUInteger generation = self.generation;
     self.status = @"Đang tải phụ đề…";
     [self fetchCaptionsForVideo:videoID player:player completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
         if (generation != self.generation) return;
-        if (![self.player.currentVideoID isEqualToString:videoID]) { [self stop]; return; }
+        if ([self stopIfVideoChangedAtStage:"captions"]) return;
         if (error || !cues.count) { [self fail:error.localizedDescription ?: @"Video chưa có phụ đề khả dụng trên TransDuck." generation:generation]; return; }
         self.cues = [cues mutableCopy];
         double previousEnd = 0;
@@ -631,7 +688,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)translateNext:(NSUInteger)generation {
     if (generation != self.generation) return;
-    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    if ([self stopIfVideoChangedAtStage:"translate request"]) return;
     if (self.translationInFlight >= 3) return;
     if (!self.translationRanges.count) {
         if (!self.translationInFlight) { self.translationComplete = YES; [self finishIfReady]; }
@@ -650,7 +707,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         [self request:path method:@"POST" body:texts completion:^(id json, NSError *error) {
             if (generation != self.generation) return;
             NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"translations"] : nil;
-            if (error || results.count != batch.count) { [self fail:error.localizedDescription ?: @"Bản dịch không đầy đủ." generation:generation]; return; }
+            if (error || results.count != batch.count) {
+                self.translationInFlight--;
+                if ([self retryRange:range generation:generation speech:NO error:error]) return;
+                [self fail:error.localizedDescription ?: @"Bản dịch không đầy đủ." generation:generation];
+                return;
+            }
             for (NSUInteger i = 0; i < batch.count; i++) {
                 NSString *text = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"text"] : nil;
                 self.cues[offset + i][@"translated"] = text.length ? text : batch[i][@"text"];
@@ -667,7 +729,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self request:@"/api/v2/ai-translate/translate" method:@"POST" body:body completion:^(id json, NSError *error) {
         if (generation != self.generation) return;
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleTranslateResults"] : nil;
-        if (error || results.count != batch.count) { [self fail:error.localizedDescription ?: @"Bản dịch không đầy đủ." generation:generation]; return; }
+        if (error || results.count != batch.count) {
+            self.translationInFlight--;
+            if ([self retryRange:range generation:generation speech:NO error:error]) return;
+            [self fail:error.localizedDescription ?: @"Bản dịch không đầy đủ." generation:generation];
+            return;
+        }
         for (NSUInteger i = 0; i < batch.count; i++) {
             NSString *text = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"translateResult"] : nil;
             self.cues[offset + i][@"translated"] = text.length ? text : batch[i][@"text"];
@@ -677,7 +744,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)translatedRange:(NSRange)range generation:(NSUInteger)generation {
     if (generation != self.generation) return;
-    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    if ([self stopIfVideoChangedAtStage:"translated batch"]) return;
     self.translationInFlight--;
     self.translatedCount += range.length;
     if (!self.startedPlayback) { self.startedPlayback = YES; [self beginPlayback:generation]; }
@@ -772,7 +839,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)synthesizeAvailable:(NSUInteger)generation {
     if (generation != self.generation || self.synthesisInFlight >= 2 || !self.speech) return;
-    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    if ([self stopIfVideoChangedAtStage:"tts request"]) return;
     if (!self.speechRanges.count) { [self finishIfReady]; return; }
     self.synthesisInFlight++;
     NSRange range = [self takeNearestRangeFrom:self.speechRanges];
@@ -786,6 +853,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleDubbingResults"] : nil;
         self.synthesisInFlight--;
         if (error || results.count != batch.count) {
+            if ([self retryRange:range generation:generation speech:YES error:error]) return;
+            os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] tts failed offset=%lu count=%lu code=%ld results=%lu", (unsigned long)range.location, (unsigned long)range.length, (long)error.code, (unsigned long)results.count);
             self.speech = NO;
             [self.speechRanges removeAllObjects];
             if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
@@ -796,14 +865,17 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             self.status = error.localizedDescription ?: @"TTS không đầy đủ; phụ đề vẫn hoạt động.";
             return;
         }
+        BOOL invalidAudio = NO;
         for (NSUInteger i = 0; i < batch.count; i++) {
             id value = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"ttsUrl"] : nil;
             NSString *url = [value isKindOfClass:NSString.class] ? value : nil;
             if ([url hasPrefix:@"https://"] && ![url.lastPathComponent.lowercaseString containsString:@"empty_audio"]) self.cues[offset + i][@"audioURL"] = url;
-            else if ([self.cues[offset + i][@"translated"] length]) {
-                [self fail:@"Một câu TTS chưa tạo được giọng. Hãy thử lại." generation:generation];
-                return;
-            }
+            else if ([self.cues[offset + i][@"translated"] length]) invalidAudio = YES;
+        }
+        if (invalidAudio) {
+            if ([self retryRange:range generation:generation speech:YES error:nil]) return;
+            [self fail:@"Một câu TTS chưa tạo được giọng. Hãy thử lại." generation:generation];
+            return;
         }
         CGFloat now = self.player.currentVideoMediaTime;
         NSInteger current = 0;
@@ -823,7 +895,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)beginPlayback:(NSUInteger)generation {
     if (generation != self.generation) return;
-    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    if ([self stopIfVideoChangedAtStage:"begin playback"]) return;
     UILabel *label = [UILabel new];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
@@ -890,7 +962,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)tick {
     YTPlayerViewController *player = self.player;
-    if (!player || ![player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
+    if ([self stopIfVideoChangedAtStage:"tick"]) return;
+    if (!player.currentVideoID.length) {
+        self.captionLabel.hidden = YES;
+        [self.audioPlayer pause];
+        self.previousTime = -1;
+        return;
+    }
     [self attachCaptionToPlayerView];
     [self applyOriginalVolume];
     CGFloat time = player.currentVideoMediaTime;
