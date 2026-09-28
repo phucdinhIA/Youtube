@@ -454,7 +454,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.loggedMissingOriginalPlayer = NO;
     self.bilingual = bilingual;
     self.showCaptions = showCaptions;
-    self.subtitleSize = MIN(36, MAX(16, subtitleSize));
+    BOOL phone = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
+    self.subtitleSize = phone ? MIN(28, MAX(14, subtitleSize)) : MIN(36, MAX(16, subtitleSize));
     self.translationRulesEnabled = translationRulesEnabled;
     self.muteOriginal = muteOriginal;
     self.preparing = YES;
@@ -1036,8 +1037,10 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [view addSubview:label];
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *position = [defaults stringForKey:@"TDCaptionPosition"] ?: @"bottom";
-    NSLayoutConstraint *vertical = [position isEqualToString:@"top"] ? [label.topAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.topAnchor constant:46] : ([position isEqualToString:@"middle"] ? [label.centerYAnchor constraintEqualToAnchor:view.centerYAnchor] : [label.bottomAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.bottomAnchor constant:-46]);
-    [NSLayoutConstraint activateConstraints:@[[label.centerXAnchor constraintEqualToAnchor:view.centerXAnchor], vertical, [label.widthAnchor constraintLessThanOrEqualToAnchor:view.widthAnchor multiplier:0.86]]];
+    BOOL phone = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
+    CGFloat inset = phone ? 36 : 46;
+    NSLayoutConstraint *vertical = [position isEqualToString:@"top"] ? [label.topAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.topAnchor constant:inset] : ([position isEqualToString:@"middle"] ? [label.centerYAnchor constraintEqualToAnchor:view.centerYAnchor] : [label.bottomAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.bottomAnchor constant:-inset]);
+    [NSLayoutConstraint activateConstraints:@[[label.centerXAnchor constraintEqualToAnchor:view.centerXAnchor], vertical, [label.widthAnchor constraintLessThanOrEqualToAnchor:view.widthAnchor multiplier:phone ? 0.92 : 0.86]]];
 }
 - (void)tick {
     YTPlayerViewController *player = self.player;
@@ -1486,7 +1489,9 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     stack.spacing = 20;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [scroll addSubview:stack];
-    [NSLayoutConstraint activateConstraints:@[[stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:24], [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-24], [stack.centerXAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.centerXAnchor], [stack.widthAnchor constraintLessThanOrEqualToConstant:500], [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-40]]];
+    NSLayoutConstraint *preferredWidth = [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32];
+    preferredWidth.priority = 999;
+    [NSLayoutConstraint activateConstraints:@[[stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:24], [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-24], [stack.centerXAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.centerXAnchor], [stack.widthAnchor constraintLessThanOrEqualToConstant:500], preferredWidth]];
     UILabel *info = [self label:@"Dịch phụ đề và lồng tiếng Việt ngay trong trình phát YouTube."];
     info.textColor = UIColor.secondaryLabelColor;
     [stack addArrangedSubview:info];
@@ -1529,9 +1534,10 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     self.captionSwitch = [UISwitch new]; self.captionSwitch.on = [defaults objectForKey:@"TDShowCaptions"] ? [defaults boolForKey:@"TDShowCaptions"] : YES;
     [stack addArrangedSubview:[self row:@"Hiện phụ đề" control:self.captionSwitch]];
     self.subtitleSizeSlider = [UISlider new];
-    self.subtitleSizeSlider.minimumValue = 16;
-    self.subtitleSizeSlider.maximumValue = 36;
-    self.subtitleSizeSlider.value = [defaults objectForKey:@"TDSubtitleSize"] ? [defaults floatForKey:@"TDSubtitleSize"] : 22;
+    BOOL phone = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
+    self.subtitleSizeSlider.minimumValue = phone ? 14 : 16;
+    self.subtitleSizeSlider.maximumValue = phone ? 28 : 36;
+    self.subtitleSizeSlider.value = [defaults objectForKey:@"TDSubtitleSize"] ? [defaults floatForKey:@"TDSubtitleSize"] : (phone ? 18 : 22);
     [stack addArrangedSubview:[self label:@"Cỡ chữ phụ đề"]];
     [stack addArrangedSubview:self.subtitleSizeSlider];
     self.captionPositionButton = [self menuButton:@"Dưới" options:@[] action:@selector(selectCaptionPosition)];
@@ -1747,6 +1753,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
         }
         [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language domain:domain speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on showCaptions:self.captionSwitch.on subtitleSize:self.subtitleSizeSlider.value translationRulesEnabled:self.rulesSwitch.on muteOriginal:self.muteSwitch.on originalVolume:self.originalVolumeSlider.value speechVolume:self.speechVolumeSlider.value resumeAfterPrepare:shouldResume];
         [self refreshActivity];
+        if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone) [self dismissViewControllerAnimated:YES completion:nil];
     }];
 }
 - (void)showSummary {
@@ -1779,7 +1786,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
         TDPanel *panel = [TDPanel new];
         panel.player = player;
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:panel];
-        nav.modalPresentationStyle = UIModalPresentationFormSheet;
+        nav.modalPresentationStyle = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone ? UIModalPresentationPageSheet : UIModalPresentationFormSheet;
         [player presentViewController:nav animated:YES completion:nil];
     };
     YMRegisterOverlayButton(button);
