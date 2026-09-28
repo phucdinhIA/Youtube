@@ -863,6 +863,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if ([self.cues[(NSUInteger)i][@"end"] doubleValue] > time) { found = i; break; }
     }
     NSInteger target = found >= 0 ? found : (next < (NSInteger)self.cues.count && [self.cues[(NSUInteger)next][@"start"] doubleValue] - time < 2 ? next : -1);
+    if (jumped && !self.preparing) {
+        [self.audioPlayer stop];
+        self.audioPlayer = nil;
+        self.audioFinished = NO;
+        self.activeIndex = -1;
+    }
     if (self.preparing) {
         if (target >= 0) self.initialCueIndex = (NSUInteger)target;
         [self releaseInitialBuffer];
@@ -893,7 +899,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSString *display = self.bilingual && cue[@"translated"] ? (originalFirst ? [NSString stringWithFormat:@"%@\n%@", cue[@"text"], translated] : [NSString stringWithFormat:@"%@\n%@", translated, cue[@"text"]]) : translated;
         if (![self.captionLabel.text isEqualToString:display]) self.captionLabel.text = display;
     }
-    if (!advancing) { [self.audioPlayer pause]; return; }
+    if (!advancing || player.playerState != 3) { [self.audioPlayer pause]; return; }
     if (self.audioPlayer && !self.audioPlayer.isPlaying && self.audioPlayer.currentTime >= self.audioPlayer.duration - 0.05) self.audioFinished = YES;
     // A synthesized phrase can be longer than its caption interval. Let it
     // finish, then play the next phrase instead of cutting off the last words.
@@ -980,7 +986,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             audio.delegate = self;
             self.audioPlayer = audio;
             self.audioFinished = NO;
-            BOOL started = self.advancing && [audio play];
+            BOOL started = self.advancing && self.player.playerState == 3 && [audio play];
             os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], audio.volume, started);
         });
     });
