@@ -17,12 +17,35 @@ static NSArray<NSDictionary *> *TDModels(void) {
         @{ @"name": @"Claude Haiku", @"id": @"claude-haiku-4-5-20251001" }
     ];
 }
+static NSArray<NSDictionary *> *TDLanguages(void) {
+    static NSArray<NSDictionary *> *languages;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableDictionary *byCode = [NSMutableDictionary dictionary];
+        for (NSDictionary *voice in TDVoiceCatalog()) {
+            NSArray *parts = [voice[@"id"] componentsSeparatedByString:@"-"];
+            if (parts.count < 3) continue;
+            NSString *code = [NSString stringWithFormat:@"%@-%@", parts[0], parts[1]];
+            NSString *name = [[NSLocale currentLocale] localizedStringForLocaleIdentifier:code] ?: code;
+            byCode[code] = @{ @"id":code, @"name":[NSString stringWithFormat:@"%@ · %@", name, code] };
+        }
+        NSMutableArray *all = [byCode.allValues mutableCopy];
+        [all sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]]; }];
+        NSDictionary *vietnamese = byCode[@"vi-VN"];
+        [all removeObject:vietnamese];
+        if (vietnamese) [all insertObject:vietnamese atIndex:0];
+        languages = all;
+    });
+    return languages;
+}
 
 @interface TDPanel : UIViewController
 @property (nonatomic, weak) YTPlayerViewController *player;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UIButton *modelButton;
 @property (nonatomic, strong) UIButton *voiceButton;
+@property (nonatomic, strong) UIButton *languageButton;
+@property (nonatomic, strong) UISlider *speechVolumeSlider;
 @property (nonatomic, strong) UISwitch *speechSwitch;
 @property (nonatomic, strong) UISwitch *bilingualSwitch;
 @property (nonatomic, strong) UISwitch *muteSwitch;
@@ -33,10 +56,13 @@ static NSArray<NSDictionary *> *TDModels(void) {
 @interface TDVoicePicker : UITableViewController <UISearchResultsUpdating>
 @property (nonatomic, copy) void (^selection)(NSDictionary *);
 @property (nonatomic, strong) NSArray<NSDictionary *> *filtered;
+@property (nonatomic, strong) NSArray<NSDictionary *> *options;
+@property (nonatomic, copy) NSString *pickerTitle;
 @end
 
 @interface TDSummaryPanel : UITableViewController
 @property (nonatomic, weak) YTPlayerViewController *player;
+@property (nonatomic, copy) NSString *targetLanguage;
 @property (nonatomic, strong) NSDictionary *summary;
 @property (nonatomic, strong) UILabel *stateLabel;
 @end
@@ -52,6 +78,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
 @property (nonatomic, copy) NSString *videoID;
 @property (nonatomic, copy) NSString *model;
 @property (nonatomic, copy) NSString *voice;
+@property (nonatomic, copy) NSString *targetLanguage;
 @property (nonatomic, copy) NSString *status;
 @property (nonatomic, copy) void (^statusChanged)(NSString *);
 @property (nonatomic) NSUInteger generation;
@@ -63,13 +90,14 @@ static NSArray<NSDictionary *> *TDModels(void) {
 @property (nonatomic) BOOL originalMuted;
 @property (nonatomic) BOOL originalMuteCaptured;
 @property (nonatomic) BOOL preparing;
+@property (nonatomic) float speechVolume;
 @property (nonatomic, strong) NSMutableSet<NSString *> *downloads;
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
 - (void)checkSession:(void (^)(BOOL))completion;
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice speech:(BOOL)speech bilingual:(BOOL)bilingual muteOriginal:(BOOL)muteOriginal;
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage speech:(BOOL)speech bilingual:(BOOL)bilingual muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume;
 - (void)stop;
-- (void)summaryForPlayer:(YTPlayerViewController *)player completion:(void (^)(NSDictionary *, NSError *))completion;
+- (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion;
 @end
 
 @implementation TDManager
@@ -167,7 +195,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
     [self stop];
     self.status = message;
 }
-- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice speech:(BOOL)speech bilingual:(BOOL)bilingual muteOriginal:(BOOL)muteOriginal {
+- (void)startForPlayer:(YTPlayerViewController *)player model:(NSString *)model voice:(NSString *)voice targetLanguage:(NSString *)targetLanguage speech:(BOOL)speech bilingual:(BOOL)bilingual muteOriginal:(BOOL)muteOriginal speechVolume:(float)speechVolume {
     [self stop];
     NSString *videoID = player.currentVideoID;
     if (!videoID.length || player.isPlayingAd) { self.status = @"Hãy mở một video trước."; return; }
@@ -175,7 +203,9 @@ static NSArray<NSDictionary *> *TDModels(void) {
     self.videoID = videoID;
     self.model = model;
     self.voice = voice;
+    self.targetLanguage = targetLanguage;
     self.speech = speech;
+    self.speechVolume = MIN(1, MAX(0, speechVolume));
     self.bilingual = bilingual;
     self.muteOriginal = muteOriginal;
     self.preparing = YES;
@@ -207,14 +237,14 @@ static NSArray<NSDictionary *> *TDModels(void) {
         completion(cues, nil);
     }];
 }
-- (void)summaryForPlayer:(YTPlayerViewController *)player completion:(void (^)(NSDictionary *, NSError *))completion {
+- (void)summaryForPlayer:(YTPlayerViewController *)player targetLanguage:(NSString *)targetLanguage completion:(void (^)(NSDictionary *, NSError *))completion {
     NSString *videoID = player.currentVideoID;
     if (!videoID.length) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:400 userInfo:@{NSLocalizedDescriptionKey:@"Hãy mở video trước."}]); return; }
     [self fetchCaptionsForVideo:videoID completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
         if (error || !cues.count) { completion(nil, error ?: [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"Video chưa có phụ đề để tóm tắt."}]); return; }
         NSMutableArray *subtitles = [NSMutableArray arrayWithCapacity:cues.count];
         for (NSDictionary *cue in cues) [subtitles addObject:@{@"text":cue[@"text"], @"start":cue[@"start"], @"end":cue[@"end"]}];
-        [self request:@"/api/v2/summary/generate" method:@"POST" body:@{@"videoId":videoID, @"subtitles":subtitles, @"targetLanguage":@"vi-VN"} completion:^(id json, NSError *requestError) {
+        [self request:@"/api/v2/summary/generate" method:@"POST" body:@{@"videoId":videoID, @"subtitles":subtitles, @"targetLanguage":targetLanguage ?: @"vi-VN"} completion:^(id json, NSError *requestError) {
             NSDictionary *payload = [json isKindOfClass:NSDictionary.class] ? json : nil;
             NSDictionary *data = [payload[@"data"] isKindOfClass:NSDictionary.class] ? payload[@"data"] : nil;
             if (requestError || ![payload[@"success"] boolValue] || ![data[@"summary"] isKindOfClass:NSString.class]) {
@@ -239,7 +269,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
     NSArray *batch = [self.cues subarrayWithRange:range];
     if ([self.model isEqualToString:@"google"]) {
         NSURLComponents *parts = [NSURLComponents componentsWithString:[TDBaseURL stringByAppendingString:@"/api/v2/translateAll"]];
-        parts.queryItems = @[[NSURLQueryItem queryItemWithName:@"language" value:@"auto"], [NSURLQueryItem queryItemWithName:@"to" value:@"vi-VN"], [NSURLQueryItem queryItemWithName:@"videoId" value:self.videoID], [NSURLQueryItem queryItemWithName:@"platform" value:@"pc"]];
+        parts.queryItems = @[[NSURLQueryItem queryItemWithName:@"language" value:@"auto"], [NSURLQueryItem queryItemWithName:@"to" value:self.targetLanguage], [NSURLQueryItem queryItemWithName:@"videoId" value:self.videoID], [NSURLQueryItem queryItemWithName:@"platform" value:@"pc"]];
         NSString *path = [parts.URL.absoluteString substringFromIndex:TDBaseURL.length];
         NSMutableArray *texts = [NSMutableArray array];
         for (NSDictionary *cue in batch) [texts addObject:cue[@"text"]];
@@ -259,7 +289,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
     for (NSDictionary *cue in batch) {
         [subtitles addObject:@{@"index":cue[@"index"], @"text":cue[@"text"], @"googleTranslation":cue[@"text"], @"start":cue[@"start"], @"end":cue[@"end"]}];
     }
-    NSDictionary *body = @{@"videoId":self.videoID, @"title":self.videoID, @"model":self.model, @"toLanguage":@"vi-VN", @"domain":@"general", @"translationRulesEnabled":@NO, @"skipTranslation":@NO, @"subtitles":subtitles};
+    NSDictionary *body = @{@"videoId":self.videoID, @"title":self.videoID, @"model":self.model, @"toLanguage":self.targetLanguage, @"domain":@"general", @"translationRulesEnabled":@NO, @"skipTranslation":@NO, @"subtitles":subtitles};
     [self request:@"/api/v2/ai-translate/translate" method:@"POST" body:body completion:^(id json, NSError *error) {
         if (generation != self.generation) return;
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleTranslateResults"] : nil;
@@ -278,7 +308,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
     NSArray *batch = [self.cues subarrayWithRange:range];
     NSMutableArray *subtitles = [NSMutableArray array];
     for (NSDictionary *cue in batch) [subtitles addObject:@{@"index":cue[@"index"], @"text":cue[@"translated"], @"start":cue[@"start"], @"end":cue[@"end"]}];
-    NSDictionary *body = @{@"subtitles":subtitles, @"config":@{@"model":self.model, @"voice":self.voice, @"voiceType":@"azure", @"toLanguage":@"vi-VN", @"skipTranslation":@YES}, @"videoDetails":@{@"videoId":self.videoID, @"title":self.videoID, @"subtitleLevel":@2}, @"v2Version":@YES};
+    NSDictionary *body = @{@"subtitles":subtitles, @"config":@{@"model":self.model, @"voice":self.voice, @"voiceType":@"azure", @"toLanguage":self.targetLanguage, @"skipTranslation":@YES}, @"videoDetails":@{@"videoId":self.videoID, @"title":self.videoID, @"subtitleLevel":@2}, @"v2Version":@YES};
     [self request:@"/api/v2/dubbing/generateDubbing" method:@"POST" body:body completion:^(id json, NSError *error) {
         if (generation != self.generation) return;
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleDubbingResults"] : nil;
@@ -393,7 +423,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
         NSError *error = nil;
         AVAudioPlayer *audio = [[AVAudioPlayer alloc] initWithData:data error:&error];
         if (!audio || error) return;
-        audio.enableRate = YES;
+    audio.enableRate = YES;
         [audio prepareToPlay];
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self.generation || self.activeIndex != index || !self.player) return;
@@ -403,6 +433,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
             audio.currentTime = MIN(MAX(0, now - [cue[@"start"] doubleValue]), audio.duration);
             CGFloat rate = [(YTMainAppVideoPlayerOverlayViewController *)self.player.activeVideoPlayerOverlay currentPlaybackRate];
             audio.rate = MIN(2, MAX(0.5, rate > 0 ? rate : 1));
+            audio.volume = self.speechVolume;
             self.audioPlayer = audio;
             if (fabs(now - self.previousTime) > 0.015) [audio play];
         });
@@ -413,8 +444,8 @@ static NSArray<NSDictionary *> *TDModels(void) {
 @implementation TDVoicePicker
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Giọng Azure";
-    self.filtered = TDVoiceCatalog();
+    self.title = self.pickerTitle ?: @"Giọng Azure";
+    self.filtered = self.options ?: TDVoiceCatalog();
     UISearchController *search = [[UISearchController alloc] initWithSearchResultsController:nil];
     search.obscuresBackgroundDuringPresentation = NO;
     search.searchResultsUpdater = self;
@@ -425,8 +456,8 @@ static NSArray<NSDictionary *> *TDModels(void) {
 }
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
     NSString *term = [searchController.searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (!term.length) self.filtered = TDVoiceCatalog();
-    else self.filtered = [TDVoiceCatalog() filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *voice, __unused NSDictionary *bindings) {
+    if (!term.length) self.filtered = self.options ?: TDVoiceCatalog();
+    else self.filtered = [(self.options ?: TDVoiceCatalog()) filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *voice, __unused NSDictionary *bindings) {
         return [voice[@"name"] localizedCaseInsensitiveContainsString:term] || [voice[@"id"] localizedCaseInsensitiveContainsString:term];
     }]];
     [self.tableView reloadData];
@@ -467,7 +498,7 @@ static NSArray<NSDictionary *> *TDModels(void) {
     [self.tableView reloadData];
     NSString *videoID = self.player.currentVideoID;
     __weak typeof(self) weakSelf = self;
-    [[TDManager shared] summaryForPlayer:self.player completion:^(NSDictionary *summary, NSError *error) {
+    [[TDManager shared] summaryForPlayer:self.player targetLanguage:self.targetLanguage completion:^(NSDictionary *summary, NSError *error) {
         if (!weakSelf || ![weakSelf.player.currentVideoID isEqualToString:videoID]) return;
         weakSelf.summary = summary;
         weakSelf.stateLabel.text = error.localizedDescription ?: @"";
@@ -556,6 +587,8 @@ static NSArray<NSDictionary *> *TDModels(void) {
     [stack addArrangedSubview:login];
     self.modelButton = [self menuButton:@"Gemini Flash Lite" options:TDModels() action:@selector(selectModel)];
     [stack addArrangedSubview:[self row:@"Mô hình dịch" control:self.modelButton]];
+    self.languageButton = [self menuButton:@"Tiếng Việt · vi-VN" options:TDLanguages() action:@selector(selectLanguage)];
+    [stack addArrangedSubview:[self row:@"Ngôn ngữ đích" control:self.languageButton]];
     self.voiceButton = [self menuButton:@"vi-VN · HoaiMy" options:@[] action:@selector(selectVoice)];
     [stack addArrangedSubview:[self row:@"Giọng Azure" control:self.voiceButton]];
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
@@ -563,12 +596,21 @@ static NSArray<NSDictionary *> *TDModels(void) {
     for (NSDictionary *item in TDModels()) if ([item[@"id"] isEqualToString:savedModel]) { [self.modelButton setTitle:item[@"name"] forState:UIControlStateNormal]; self.modelButton.accessibilityValue = savedModel; break; }
     NSString *savedVoice = [defaults stringForKey:@"TDVoice"];
     for (NSDictionary *item in TDVoiceCatalog()) if ([item[@"id"] isEqualToString:savedVoice]) { [self.voiceButton setTitle:item[@"name"] forState:UIControlStateNormal]; self.voiceButton.accessibilityValue = savedVoice; break; }
+    NSString *savedLanguage = [defaults stringForKey:@"TDLanguage"];
+    for (NSDictionary *item in TDLanguages()) if ([item[@"id"] isEqualToString:savedLanguage]) { [self.languageButton setTitle:item[@"name"] forState:UIControlStateNormal]; self.languageButton.accessibilityValue = savedLanguage; break; }
     self.speechSwitch = [UISwitch new]; self.speechSwitch.on = [defaults objectForKey:@"TDSpeech"] ? [defaults boolForKey:@"TDSpeech"] : YES;
     [stack addArrangedSubview:[self row:@"Lồng tiếng" control:self.speechSwitch]];
     self.bilingualSwitch = [UISwitch new]; self.bilingualSwitch.on = [defaults boolForKey:@"TDBilingual"];
     [stack addArrangedSubview:[self row:@"Phụ đề song ngữ" control:self.bilingualSwitch]];
     self.muteSwitch = [UISwitch new]; self.muteSwitch.on = [defaults boolForKey:@"TDMuteOriginal"];
     [stack addArrangedSubview:[self row:@"Tắt tiếng video gốc" control:self.muteSwitch]];
+    [stack addArrangedSubview:[self label:@"Giữ tiếng gốc bật mặc định. Có thể tắt nếu chỉ muốn nghe giọng lồng tiếng."]];
+    self.speechVolumeSlider = [UISlider new];
+    self.speechVolumeSlider.minimumValue = 0;
+    self.speechVolumeSlider.maximumValue = 1;
+    self.speechVolumeSlider.value = [defaults objectForKey:@"TDSpeechVolume"] ? [defaults floatForKey:@"TDSpeechVolume"] : 1;
+    [stack addArrangedSubview:[self label:@"Âm lượng lồng tiếng"]];
+    [stack addArrangedSubview:self.speechVolumeSlider];
     self.startButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.startButton setTitle:@"Dịch và phát" forState:UIControlStateNormal];
     self.startButton.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
@@ -615,6 +657,17 @@ static NSArray<NSDictionary *> *TDModels(void) {
     };
     [self.navigationController pushViewController:picker animated:YES];
 }
+- (void)selectLanguage {
+    TDVoicePicker *picker = [TDVoicePicker new];
+    picker.options = TDLanguages();
+    picker.pickerTitle = @"Ngôn ngữ đích";
+    __weak typeof(self) weakSelf = self;
+    picker.selection = ^(NSDictionary *language) {
+        [weakSelf.languageButton setTitle:language[@"name"] forState:UIControlStateNormal];
+        weakSelf.languageButton.accessibilityValue = language[@"id"];
+    };
+    [self.navigationController pushViewController:picker animated:YES];
+}
 - (void)choose:(NSString *)title options:(NSArray<NSDictionary *> *)options button:(UIButton *)button {
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     for (NSDictionary *option in options) [sheet addAction:[UIAlertAction actionWithTitle:option[@"name"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) { [button setTitle:option[@"name"] forState:UIControlStateNormal]; button.accessibilityValue = option[@"id"]; }]];
@@ -626,20 +679,24 @@ static NSArray<NSDictionary *> *TDModels(void) {
 - (void)start {
     NSString *model = self.modelButton.accessibilityValue ?: @"gemini-3.5-flash-lite";
     NSString *voice = self.voiceButton.accessibilityValue ?: @"vi-VN-HoaiMyNeural";
+    NSString *language = self.languageButton.accessibilityValue ?: @"vi-VN";
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults setObject:model forKey:@"TDModel"];
     [defaults setObject:voice forKey:@"TDVoice"];
+    [defaults setObject:language forKey:@"TDLanguage"];
     [defaults setBool:self.speechSwitch.on forKey:@"TDSpeech"];
     [defaults setBool:self.bilingualSwitch.on forKey:@"TDBilingual"];
     [defaults setBool:self.muteSwitch.on forKey:@"TDMuteOriginal"];
+    [defaults setFloat:self.speechVolumeSlider.value forKey:@"TDSpeechVolume"];
     [[TDManager shared] checkSession:^(BOOL signedIn) {
         if (!signedIn) { self.statusLabel.text = @"Đăng nhập TransDuck trước khi dịch."; return; }
-        [[TDManager shared] startForPlayer:self.player model:model voice:voice speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on muteOriginal:self.muteSwitch.on];
+        [[TDManager shared] startForPlayer:self.player model:model voice:voice targetLanguage:language speech:self.speechSwitch.on bilingual:self.bilingualSwitch.on muteOriginal:self.muteSwitch.on speechVolume:self.speechVolumeSlider.value];
     }];
 }
 - (void)showSummary {
     TDSummaryPanel *panel = [TDSummaryPanel new];
     panel.player = self.player;
+    panel.targetLanguage = self.languageButton.accessibilityValue ?: @"vi-VN";
     [self.navigationController pushViewController:panel animated:YES];
 }
 - (void)stop { [[TDManager shared] stop]; }
