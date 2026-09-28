@@ -176,6 +176,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, weak) AVPlayer *volumePlayer;
 @property (nonatomic) float previousOriginalVolume;
 @property (nonatomic) BOOL loggedMissingOriginalPlayer;
+@property (nonatomic) CFTimeInterval lastOriginalPlayerSearch;
+@property (nonatomic, weak) UIView *searchedPlayerView;
 @property (nonatomic) NSUInteger translatedCount;
 @property (nonatomic) NSUInteger synthesizedCount;
 @property (nonatomic) NSUInteger translationInFlight;
@@ -283,7 +285,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)stop {
     YTPlayerViewController *resumePlayer = self.player;
     NSString *resumeVideoID = self.videoID;
-    BOOL resume = self.resumeAfterPrepare;
+    BOOL resume = self.resumeAfterPrepare || self.resumeAfterSeek;
     self.resumeAfterPrepare = NO;
     self.generation++;
     [self.timer invalidate];
@@ -763,8 +765,15 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)applyOriginalVolume {
     if (!self.speech || !self.player.playerView) return;
-    AVPlayer *player = TDPlayerInLayer(self.player.playerView.layer);
+    UIView *playerView = self.player.playerView;
+    CFTimeInterval now = CACurrentMediaTime();
+    BOOL shouldSearch = playerView != self.searchedPlayerView || now - self.lastOriginalPlayerSearch > 2;
+    if (!shouldSearch && !self.volumePlayer) return;
+    AVPlayer *player = shouldSearch ? TDPlayerInLayer(playerView.layer) : self.volumePlayer;
+    if (shouldSearch) { self.searchedPlayerView = playerView; self.lastOriginalPlayerSearch = now; }
     if (!player) {
+        if (self.volumePlayer) self.volumePlayer.volume = self.previousOriginalVolume;
+        self.volumePlayer = nil;
         if (!self.loggedMissingOriginalPlayer) {
             NSLog(@"[TransDuckAudio] original AVPlayer layer unavailable");
             int budget = 30;
@@ -1420,6 +1429,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [self persistSettings];
     TDManager *manager = [TDManager shared];
     manager.originalVolume = self.originalVolumeSlider.value;
+    manager.lastOriginalPlayerSearch = 0;
     [manager applyOriginalVolume];
 }
 - (void)start {
