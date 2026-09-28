@@ -35,7 +35,9 @@ static id TDObjectIvar(id object, const char *name) {
 }
 static id TDSourceVolumeTarget(YTPlayerViewController *player) {
     id queuePlayer = TDObjectIvar(player.activeVideo, "_player");
+    if (queuePlayer && [queuePlayer respondsToSelector:@selector(setVolume:)] && [queuePlayer respondsToSelector:@selector(volume)]) return queuePlayer;
     id trackRenderer = TDObjectIvar(queuePlayer, "_audioTrackRenderer");
+    if (trackRenderer && [trackRenderer respondsToSelector:@selector(setVolume:)] && [trackRenderer respondsToSelector:@selector(volume)]) return trackRenderer;
     id renderer = TDObjectIvar(trackRenderer, "_renderer");
     if (renderer && [renderer respondsToSelector:@selector(setVolume:)] && [renderer respondsToSelector:@selector(volume)]) return renderer;
     return TDPlayerInLayer(player.playerView.layer);
