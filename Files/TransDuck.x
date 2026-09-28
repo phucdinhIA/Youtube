@@ -91,6 +91,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) NSUInteger generation;
 @property (nonatomic) NSInteger activeIndex;
 @property (nonatomic) CGFloat previousTime;
+@property (nonatomic) BOOL advancing;
 @property (nonatomic) BOOL speech;
 @property (nonatomic) BOOL bilingual;
 @property (nonatomic) BOOL muteOriginal;
@@ -348,11 +349,15 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleDubbingResults"] : nil;
         if (error || results.count != batch.count) { self.preparing = NO; self.status = error.localizedDescription ?: @"TTS không đầy đủ; phụ đề vẫn hoạt động."; return; }
         for (NSUInteger i = 0; i < batch.count; i++) {
-            NSString *url = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"ttsUrl"] : nil;
+            id value = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"ttsUrl"] : nil;
+            NSString *url = [value isKindOfClass:NSString.class] ? value : nil;
             if ([url hasPrefix:@"https://"] && ![url.lastPathComponent.lowercaseString containsString:@"empty_audio"]) self.cues[offset + i][@"audioURL"] = url;
         }
         if (self.activeIndex >= (NSInteger)offset && self.activeIndex < (NSInteger)NSMaxRange(range) && !self.audioPlayer) self.activeIndex = -1;
-        [self prefetchNearIndex:MAX(0, self.activeIndex)];
+        CGFloat now = self.player.currentVideoMediaTime;
+        NSInteger current = 0;
+        while (current + 1 < (NSInteger)self.cues.count && [self.cues[(NSUInteger)(current + 1)][@"start"] doubleValue] <= now) current++;
+        [self prefetchNearIndex:current];
         [self synthesizeFrom:NSMaxRange(range) generation:generation];
     }];
 }
@@ -389,6 +394,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (!player || ![player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
     CGFloat time = player.currentVideoMediaTime;
     BOOL advancing = self.previousTime < 0 || fabs(time - self.previousTime) > 0.015;
+    self.advancing = advancing;
     self.previousTime = time;
     NSInteger low = 0, high = (NSInteger)self.cues.count - 1, found = -1;
     while (low <= high) {
@@ -469,7 +475,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             audio.rate = MIN(2, MAX(0.5, rate > 0 ? rate : 1));
             audio.volume = self.speechVolume;
             self.audioPlayer = audio;
-            if (fabs(now - self.previousTime) > 0.015) [audio play];
+            if (self.advancing) [audio play];
         });
     });
 }
