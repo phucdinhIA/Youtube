@@ -179,7 +179,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) NSArray<NSNumber *> *prefixMaxEnd;
 @property (nonatomic, strong) NSCache<NSString *, NSData *> *audioCache;
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
+@property (nonatomic, strong) AVAudioPlayer *tailAudioPlayer;
+@property (nonatomic, strong) AVAudioPlayer *preparedAudioPlayer;
+@property (nonatomic) NSInteger preparedAudioIndex;
+@property (nonatomic) NSInteger preparingAudioIndex;
 @property (nonatomic) BOOL audioFinished;
+@property (nonatomic) CGFloat activeVoiceStretch;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) UILabel *captionLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *playerActivity;
@@ -259,6 +264,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)finishSpeechCueAtIndex:(NSUInteger)index silent:(BOOL)silent;
 - (void)recoverSpeechCueAtIndex:(NSUInteger)index generation:(NSUInteger)generation;
 - (void)retryOrSkipSpeechCueAtIndex:(NSUInteger)index generation:(NSUInteger)generation;
+- (void)prepareUpcomingAudio;
+- (void)startAudio:(AVAudioPlayer *)audio index:(NSInteger)index;
 @end
 
 @implementation TDManager
@@ -279,6 +286,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         _audioCache.totalCostLimit = 24 * 1024 * 1024;
         _downloads = [NSMutableSet set];
         _activeIndex = -1;
+        _preparedAudioIndex = -1;
+        _preparingAudioIndex = -1;
     }
     return self;
 }
@@ -343,8 +352,14 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.timer invalidate];
     self.timer = nil;
     [self.audioPlayer stop];
+    [self.tailAudioPlayer stop];
     self.audioPlayer = nil;
+    self.tailAudioPlayer = nil;
+    self.preparedAudioPlayer = nil;
+    self.preparedAudioIndex = -1;
+    self.preparingAudioIndex = -1;
     self.audioFinished = NO;
+    self.activeVoiceStretch = 1;
     self.previousTime = -1;
     self.previousTickWallTime = 0;
     self.lastProgressWallTime = 0;
@@ -1058,6 +1073,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (!player.currentVideoID.length) {
         self.captionLabel.hidden = YES;
         [self.audioPlayer pause];
+        [self.tailAudioPlayer pause];
         self.previousTime = -1;
         self.previousTickWallTime = 0;
         return;
@@ -1068,6 +1084,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     if (player.isPlayingAd || !isfinite(time) || time < 0) {
         self.captionLabel.hidden = YES;
         [self.audioPlayer pause];
+        [self.tailAudioPlayer pause];
         self.previousTime = -1;
         self.previousTickWallTime = 0;
         return;
@@ -1107,7 +1124,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }
     if (jumped && !self.preparing) {
         [self.audioPlayer stop];
+        [self.tailAudioPlayer stop];
         self.audioPlayer = nil;
+        self.tailAudioPlayer = nil;
+        self.preparedAudioPlayer = nil;
+        self.preparedAudioIndex = -1;
+        self.preparingAudioIndex = -1;
         self.audioFinished = NO;
         self.activeIndex = -1;
     }
@@ -1128,7 +1150,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.bufferedSequentialCue = !jumped && speechTarget != found;
         self.resumeAfterSeek = player.playerState == 3;
         [self.audioPlayer stop];
+        [self.tailAudioPlayer stop];
         self.audioPlayer = nil;
+        self.tailAudioPlayer = nil;
+        self.preparedAudioPlayer = nil;
+        self.preparedAudioIndex = -1;
+        self.preparingAudioIndex = -1;
         self.audioFinished = NO;
         self.activeIndex = -1;
         self.status = @"Đang chuẩn bị giọng lồng tiếng…";
@@ -1156,15 +1183,51 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSString *display = self.bilingual && cue[@"translated"] ? (originalFirst ? [NSString stringWithFormat:@"%@\n%@", cue[@"text"], translated] : [NSString stringWithFormat:@"%@\n%@", translated, cue[@"text"]]) : translated;
         if (![self.captionLabel.text isEqualToString:display]) self.captionLabel.text = display;
     }
-    if (!advancing || player.playerState != 3) { [self.audioPlayer pause]; return; }
+    if (!advancing || player.playerState != 3) {
+        [self.audioPlayer pause];
+        [self.tailAudioPlayer stop];
+        self.tailAudioPlayer = nil;
+        return;
+    }
     // Keep the current phrase until it ends. Never rewind a playing phrase:
     // caption intervals can be much shorter than their synthesized audio.
     if (self.audioPlayer && !self.audioFinished) {
-        NSDictionary *cue = self.cues[(NSUInteger)self.activeIndex];
-        CGFloat playbackRate = TDPlaybackRate(player);
-        CGFloat stretch = TDSpeechStretch(self.audioPlayer, cue, time, playbackRate);
-        self.audioPlayer.rate = stretch * playbackRate;
+        // Keep one voice rate for the whole phrase. Recomputing it on every
+        // timer tick makes the narration surge and sound broken mid-sentence.
+        // Only follow an actual change to the video's playback speed.
+        self.audioPlayer.rate = self.activeVoiceStretch * TDPlaybackRate(player);
         if (!self.audioPlayer.isPlaying) [self.audioPlayer play];
+        [self prepareUpcomingAudio];
+        NSInteger upcoming = self.activeIndex + 1;
+        if (self.preparedAudioPlayer && self.preparedAudioIndex == upcoming &&
+            upcoming < (NSInteger)self.cues.count &&
+            [self.cues[(NSUInteger)upcoming][@"start"] doubleValue] <= time + 0.12 &&
+            (self.audioPlayer.duration - self.audioPlayer.currentTime) / MAX(0.5, self.audioPlayer.rate) <= 0.18) {
+            AVAudioPlayer *nextAudio = self.preparedAudioPlayer;
+            AVAudioPlayer *previousAudio = self.audioPlayer;
+            self.preparedAudioPlayer = nil;
+            self.preparedAudioIndex = -1;
+            NSDictionary *upcomingCue = self.cues[(NSUInteger)upcoming];
+            CGFloat rate = TDPlaybackRate(player);
+            CGFloat stretch = TDSpeechStretch(nextAudio, upcomingCue, time, rate);
+            nextAudio.currentTime = 0;
+            nextAudio.rate = stretch * rate;
+            nextAudio.volume = self.speechVolume * 0.2;
+            nextAudio.delegate = self;
+            if ([nextAudio play]) {
+                [self.tailAudioPlayer stop];
+                self.tailAudioPlayer = previousAudio;
+                self.audioPlayer = nextAudio;
+                self.activeIndex = upcoming;
+                self.activeVoiceStretch = stretch;
+                self.audioFinished = NO;
+                [previousAudio setVolume:self.speechVolume * 0.6 fadeDuration:0.12];
+                [nextAudio setVolume:self.speechVolume fadeDuration:0.12];
+                os_log(OS_LOG_DEFAULT, "[TransDuckVoice] crossfade cue=%ld overlap=%.2f rate=%.2f", (long)upcoming, (previousAudio.duration - previousAudio.currentTime) / MAX(0.5, previousAudio.rate), nextAudio.rate);
+                [self prefetchNearIndex:upcoming];
+                [self prepareUpcomingAudio];
+            }
+        }
         return;
     }
     // The active index is the last narrated cue. An earlier overlapping cue
@@ -1188,6 +1251,31 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)prefetchNearIndex:(NSInteger)index {
     if (!self.speech || !self.cues.count) return;
     for (NSInteger i = MAX(0, index); i < MIN((NSInteger)self.cues.count, index + 4); i++) [self loadAudioAtIndex:i];
+}
+- (void)prepareUpcomingAudio {
+    NSInteger index = self.activeIndex + 1;
+    if (!self.speech || index < 0 || index >= (NSInteger)self.cues.count ||
+        self.preparedAudioIndex == index || self.preparingAudioIndex == index) return;
+    NSString *url = self.cues[(NSUInteger)index][@"audioURL"];
+    if (!url.length) return;
+    NSData *data = [self.audioCache objectForKey:url];
+    if (!data.length) { [self loadAudioAtIndex:index]; return; }
+    self.preparingAudioIndex = index;
+    NSUInteger generation = self.generation;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        AVAudioPlayer *audio = [[AVAudioPlayer alloc] initWithData:data error:&error];
+        if (audio && !error) { audio.enableRate = YES; [audio prepareToPlay]; }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self.generation) return;
+            if (self.preparingAudioIndex == index) self.preparingAudioIndex = -1;
+            if (audio && !error && self.activeIndex + 1 == index &&
+                [self.cues[(NSUInteger)index][@"audioURL"] isEqualToString:url]) {
+                self.preparedAudioPlayer = audio;
+                self.preparedAudioIndex = index;
+            }
+        });
+    });
 }
 - (void)loadAudioAtIndex:(NSInteger)index {
     if (index < 0 || index >= (NSInteger)self.cues.count) return;
@@ -1220,6 +1308,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             }
             [self.audioDownloadRetries removeObjectForKey:urlString];
             [self.audioCache setObject:data forKey:urlString cost:data.length];
+            if (index == self.activeIndex + 1) [self prepareUpcomingAudio];
             if (self.preparing && index == (NSInteger)self.initialCueIndex) [self releaseInitialBuffer];
             if (self.bufferingSeek && index == self.bufferedCueIndex) [self releaseSeekBufferIfReady];
             if (self.activeIndex == index && self.player && !self.audioPlayer) [self playData:data index:index];
@@ -1227,6 +1316,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }] resume];
 }
 - (void)playData:(NSData *)data index:(NSInteger)index {
+    if (self.preparedAudioPlayer && self.preparedAudioIndex == index) {
+        AVAudioPlayer *audio = self.preparedAudioPlayer;
+        self.preparedAudioPlayer = nil;
+        self.preparedAudioIndex = -1;
+        [self startAudio:audio index:index];
+        return;
+    }
     NSUInteger generation = self.generation;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
@@ -1241,29 +1337,43 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         [audio prepareToPlay];
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self.generation || self.activeIndex != index || !self.player) return;
-            CGFloat now = self.player.currentVideoMediaTime;
-            NSDictionary *cue = self.cues[(NSUInteger)index];
-            if (now < [cue[@"start"] doubleValue]) return;
-            CGFloat playbackRate = TDPlaybackRate(self.player);
-            CGFloat stretch = TDSpeechStretch(audio, cue, now, playbackRate);
-            // Play complete speech even when decoding or a network response
-            // arrives after the caption begins. Seeking resets activeIndex.
-            audio.currentTime = 0;
-            audio.rate = stretch * playbackRate;
-            audio.volume = self.speechVolume;
-            audio.delegate = self;
-            self.audioPlayer = audio;
-            self.audioFinished = NO;
-            BOOL started = self.advancing && self.player.playerState == 3 && [audio play];
-            if (started) [self.cues[(NSUInteger)index] removeObjectForKey:@"audioRecoveryAttempts"];
-            os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], audio.volume, started);
+            [self startAudio:audio index:index];
         });
     });
 }
+- (void)startAudio:(AVAudioPlayer *)audio index:(NSInteger)index {
+    CGFloat now = self.player.currentVideoMediaTime;
+    NSDictionary *cue = self.cues[(NSUInteger)index];
+    CGFloat start = [cue[@"start"] doubleValue];
+    if (now < start) {
+        NSUInteger generation = self.generation;
+        NSTimeInterval delay = MIN(1, (start - now) / TDPlaybackRate(self.player));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (generation == self.generation && self.activeIndex == index && !self.audioPlayer)
+                [self startAudio:audio index:index];
+        });
+        return;
+    }
+    CGFloat playbackRate = TDPlaybackRate(self.player);
+    CGFloat stretch = TDSpeechStretch(audio, cue, now, playbackRate);
+    audio.currentTime = 0;
+    audio.rate = stretch * playbackRate;
+    audio.volume = self.speechVolume;
+    audio.delegate = self;
+    self.audioPlayer = audio;
+    self.audioFinished = NO;
+    self.activeVoiceStretch = stretch;
+    BOOL started = self.advancing && self.player.playerState == 3 && [audio play];
+    if (started) [self.cues[(NSUInteger)index] removeObjectForKey:@"audioRecoveryAttempts"];
+    os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f rate=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], audio.rate, audio.volume, started);
+    [self prepareUpcomingAudio];
+}
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
+    if (player == self.tailAudioPlayer) { self.tailAudioPlayer = nil; return; }
     if (player != self.audioPlayer) return;
     self.audioFinished = YES;
     os_log(OS_LOG_DEFAULT, "[TransDuckVoice] finished cue=%ld success=%d", (long)self.activeIndex, flag);
+    dispatch_async(dispatch_get_main_queue(), ^{ if (player == self.audioPlayer) [self tick]; });
 }
 @end
 
