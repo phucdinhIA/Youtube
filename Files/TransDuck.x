@@ -265,6 +265,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.status = @"Đang tải phụ đề…";
     [self fetchCaptionsForVideo:videoID completion:^(NSArray<NSMutableDictionary *> *cues, NSError *error) {
         if (generation != self.generation) return;
+        if (![self.player.currentVideoID isEqualToString:videoID]) { [self stop]; return; }
         if (error || !cues.count) { [self fail:error.localizedDescription ?: @"Video chưa có phụ đề khả dụng trên TransDuck." generation:generation]; return; }
         self.cues = [cues mutableCopy];
         NSMutableArray<NSNumber *> *maxEnds = [NSMutableArray arrayWithCapacity:cues.count];
@@ -354,6 +355,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)translateFrom:(NSUInteger)offset generation:(NSUInteger)generation {
     if (generation != self.generation) return;
+    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
     if (offset >= self.cues.count) {
         self.translationComplete = YES;
         [self finishIfReady];
@@ -397,6 +399,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)translatedThrough:(NSUInteger)offset generation:(NSUInteger)generation {
     if (generation != self.generation) return;
+    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
     self.translatedCount = offset;
     if (!self.startedPlayback) { self.startedPlayback = YES; [self beginPlayback:generation]; }
     if (self.speech) [self synthesizeAvailable:generation];
@@ -411,6 +414,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)synthesizeAvailable:(NSUInteger)generation {
     if (generation != self.generation || self.synthesisInFlight || !self.speech) return;
+    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
     NSUInteger offset = self.synthesizedCount;
     if (offset >= self.translatedCount) { [self finishIfReady]; return; }
     self.synthesisInFlight = YES;
@@ -448,6 +452,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 }
 - (void)beginPlayback:(NSUInteger)generation {
     if (generation != self.generation) return;
+    if (![self.player.currentVideoID isEqualToString:self.videoID]) { [self stop]; return; }
     UILabel *label = [UILabel new];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
@@ -855,6 +860,14 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     for (NSDictionary *item in TDVoiceCatalog()) if ([item[@"id"] isEqualToString:savedVoice]) { [self.voiceButton setTitle:item[@"name"] forState:UIControlStateNormal]; self.voiceButton.accessibilityValue = savedVoice; break; }
     NSString *savedLanguage = [defaults stringForKey:@"TDLanguage"];
     for (NSDictionary *item in TDLanguages()) if ([item[@"id"] isEqualToString:savedLanguage]) { [self.languageButton setTitle:item[@"name"] forState:UIControlStateNormal]; self.languageButton.accessibilityValue = savedLanguage; break; }
+    NSString *voicePrefix = [(self.languageButton.accessibilityValue ?: @"vi-VN") stringByAppendingString:@"-"];
+    if (![self.voiceButton.accessibilityValue hasPrefix:voicePrefix]) {
+        for (NSDictionary *voice in TDVoiceCatalog()) if ([voice[@"id"] hasPrefix:voicePrefix]) {
+            [self.voiceButton setTitle:voice[@"name"] forState:UIControlStateNormal];
+            self.voiceButton.accessibilityValue = voice[@"id"];
+            break;
+        }
+    }
     self.speechSwitch = [UISwitch new]; self.speechSwitch.on = [defaults objectForKey:@"TDSpeech"] ? [defaults boolForKey:@"TDSpeech"] : YES;
     [stack addArrangedSubview:[self row:@"Lồng tiếng" control:self.speechSwitch]];
     self.bilingualSwitch = [UISwitch new]; self.bilingualSwitch.on = [defaults boolForKey:@"TDBilingual"];
@@ -980,6 +993,16 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     picker.selection = ^(NSDictionary *language) {
         [weakSelf.languageButton setTitle:language[@"name"] forState:UIControlStateNormal];
         weakSelf.languageButton.accessibilityValue = language[@"id"];
+        NSString *voicePrefix = [language[@"id"] stringByAppendingString:@"-"];
+        if (![weakSelf.voiceButton.accessibilityValue hasPrefix:voicePrefix]) {
+            for (NSDictionary *voice in TDVoiceCatalog()) {
+                if ([voice[@"id"] hasPrefix:voicePrefix]) {
+                    [weakSelf.voiceButton setTitle:voice[@"name"] forState:UIControlStateNormal];
+                    weakSelf.voiceButton.accessibilityValue = voice[@"id"];
+                    break;
+                }
+            }
+        }
     };
     [self.navigationController pushViewController:picker animated:YES];
 }
