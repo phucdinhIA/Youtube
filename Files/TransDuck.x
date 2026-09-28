@@ -603,9 +603,10 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
         [self.statusLabel.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-20],
         [self.textView.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:12],
         [self.textView.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:16],
-        [self.textView.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-16],
-        [self.textView.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor]
+        [self.textView.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-16]
     ]];
+    if (@available(iOS 15.0, *)) [[self.textView.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor] setActive:YES];
+    else [[self.textView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor] setActive:YES];
     NSString *videoID = self.player.currentVideoID;
     self.videoID = videoID;
     __weak typeof(self) weakSelf = self;
