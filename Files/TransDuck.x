@@ -20,9 +20,10 @@ static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, CGFloat 
     CGFloat remainingVideo = [cue[@"end"] doubleValue] - videoTime;
     CGFloat remainingSpeech = audio.duration - audio.currentTime;
     if (!isfinite(remainingVideo) || !isfinite(remainingSpeech) || remainingSpeech <= 0) return 1;
-    if (remainingVideo <= 0) return 1.6 / MAX(0.5, playbackRate);
-    // Catch up when a voice starts late without repeatedly pausing the video.
-    return MIN(MAX(1, remainingSpeech / remainingVideo), 1.6 / MAX(0.5, playbackRate));
+    // Keep the complete phrase audible. The extension caps voice acceleration
+    // and waits for the audio end event before starting the next phrase.
+    if (remainingVideo <= 0) return 1.4 / MAX(0.5, playbackRate);
+    return MIN(MAX(1, remainingSpeech / remainingVideo), 1.4 / MAX(0.5, playbackRate));
 }
 static AVPlayer *TDPlayerInLayer(CALayer *layer) {
     if ([layer isKindOfClass:AVPlayerLayer.class] && ((AVPlayerLayer *)layer).player) return ((AVPlayerLayer *)layer).player;
@@ -192,6 +193,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) NSUInteger generation;
 @property (nonatomic) NSInteger activeIndex;
 @property (nonatomic) CGFloat previousTime;
+@property (nonatomic) CFTimeInterval previousTickWallTime;
+@property (nonatomic) CFTimeInterval lastProgressWallTime;
 @property (nonatomic) NSInteger lastCaptionDiagnosticSecond;
 @property (nonatomic) CFTimeInterval videoIDUnavailableSince;
 @property (nonatomic) BOOL advancing;
@@ -342,6 +345,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.audioPlayer stop];
     self.audioPlayer = nil;
     self.audioFinished = NO;
+    self.previousTime = -1;
+    self.previousTickWallTime = 0;
+    self.lastProgressWallTime = 0;
     [self.playerActivity stopAnimating];
     [self.playerActivity removeFromSuperview];
     self.playerActivity = nil;
@@ -843,6 +849,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     BOOL resume = self.resumeAfterSeek;
     self.resumeAfterSeek = NO;
     self.previousTime = -1;
+    self.previousTickWallTime = 0;
+    self.lastProgressWallTime = 0;
     if (resume && [self.player.currentVideoID isEqualToString:self.videoID]) [self.player play];
 }
 - (void)finishSpeechCueAtIndex:(NSUInteger)index silent:(BOOL)silent {
@@ -993,6 +1001,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.captionLabel = label;
     [self attachCaptionToPlayerView];
     self.previousTime = -1;
+    self.previousTickWallTime = 0;
+    self.lastProgressWallTime = 0;
     [self applyOriginalVolume];
     if (self.speech && self.muteOriginal && self.player.activeVideo) {
         self.mutedVideo = self.player.activeVideo;
@@ -1049,6 +1059,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.captionLabel.hidden = YES;
         [self.audioPlayer pause];
         self.previousTime = -1;
+        self.previousTickWallTime = 0;
         return;
     }
     [self attachCaptionToPlayerView];
@@ -1058,12 +1069,23 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         self.captionLabel.hidden = YES;
         [self.audioPlayer pause];
         self.previousTime = -1;
+        self.previousTickWallTime = 0;
         return;
     }
-    BOOL jumped = self.previousTime >= 0 && fabs(time - self.previousTime) > MAX(0.55, 0.4 * TDPlaybackRate(player));
-    BOOL advancing = self.previousTime < 0 || fabs(time - self.previousTime) > 0.015;
+    CFTimeInterval tickWallTime = CACurrentMediaTime();
+    CGFloat delta = self.previousTime >= 0 ? time - self.previousTime : 0;
+    CFTimeInterval elapsed = self.previousTickWallTime > 0 ? tickWallTime - self.previousTickWallTime : 0;
+    // A delayed timer tick can legitimately advance the video by more than
+    // 0.55 s. Only treat motion beyond elapsed wall time as a seek.
+    BOOL jumped = self.previousTime >= 0 &&
+        (delta < -0.35 || delta > MAX(0.9, elapsed * TDPlaybackRate(player) + 0.65));
+    if (jumped) os_log(OS_LOG_DEFAULT, "[TransDuckVoice] seek delta=%.2f elapsed=%.2f", delta, elapsed);
+    if (self.previousTime < 0 || delta > 0.015 || jumped) self.lastProgressWallTime = tickWallTime;
+    BOOL advancing = self.previousTime < 0 || delta > 0.015 ||
+        (player.playerState == 3 && tickWallTime - self.lastProgressWallTime < 0.75);
     self.advancing = advancing;
     self.previousTime = time;
+    self.previousTickWallTime = tickWallTime;
     // Find the latest cue that has started, then inspect only cues whose
     // prefix contains an interval that might still cover this time.
     NSInteger low = 0, high = (NSInteger)self.cues.count;
