@@ -386,8 +386,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)fetchNativeCaptionsForVideo:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
     if (![player.currentVideoID isEqualToString:videoID]) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:409 userInfo:@{NSLocalizedDescriptionKey:@"Video đã thay đổi."}]); return; }
     YTPlayerResponse *response = [player respondsToSelector:@selector(contentPlayerResponse)] ? player.contentPlayerResponse : nil;
-    if (!response) response = player.playerResponse;
     NSArray *available = response.playerData.captions.playerCaptionsTracklistRenderer.captionTracksArray;
+    if (!available.count) available = player.playerResponse.playerData.captions.playerCaptionsTracklistRenderer.captionTracksArray;
+    NSLog(@"[TransDuckCaptions] video=%@ nativeTracks=%lu", videoID, (unsigned long)available.count);
     if (![available isKindOfClass:NSArray.class] || !available.count) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"Video chưa có phụ đề khả dụng trong trình phát YouTube."}]); return; }
     NSString *activeVSS = player.activeVideo.activeCaptionTrack.VSSID;
     NSMutableArray<YTICaptionTrackEntry *> *tracks = [NSMutableArray array];
@@ -396,7 +397,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self fetchNativeCaptionTrackAtIndex:0 tracks:tracks videoID:videoID player:player completion:completion];
 }
 - (void)fetchNativeCaptionTrackAtIndex:(NSUInteger)index tracks:(NSArray<YTICaptionTrackEntry *> *)tracks videoID:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
-    if (index >= tracks.count) { completion(nil, [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"YouTube có track phụ đề nhưng không tải được nội dung."}]); return; }
+    if (index >= tracks.count) { NSLog(@"[TransDuckCaptions] all native tracks failed video=%@", videoID); completion(nil, [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"YouTube có track phụ đề nhưng không tải được nội dung."}]); return; }
     NSString *baseURL = tracks[index].baseURL;
     NSURLComponents *parts = [NSURLComponents componentsWithString:baseURL];
     NSString *host = parts.host.lowercaseString;
@@ -413,6 +414,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         NSArray *cues = !error && [http isKindOfClass:NSHTTPURLResponse.class] && http.statusCode == 200 && data.length ? [self parseNativeCaptionJSON:data] : @[];
+        if (!cues.count) NSLog(@"[TransDuckCaptions] track=%lu http=%ld bytes=%lu error=%@", (unsigned long)index, (long)http.statusCode, (unsigned long)data.length, error.localizedDescription);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (cues.count) completion(cues, nil);
             else [self fetchNativeCaptionTrackAtIndex:index + 1 tracks:tracks videoID:videoID player:player completion:completion];
