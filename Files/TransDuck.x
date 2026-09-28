@@ -2,6 +2,8 @@
 #import <AVFoundation/AVFoundation.h>
 #import "TransDuckVoices.h"
 
+extern void TDShowTranslationPreferences(UINavigationController *navigation, NSString *language, NSString *domain);
+
 // All player and UI state stays on the main queue. Network callbacks return there.
 static NSString *const TDBaseURL = @"https://yd.transduck.com";
 static NSArray<NSDictionary *> *TDModels(void) {
@@ -831,6 +833,10 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     [editSubtitles setTitle:@"Chỉnh sửa phụ đề" forState:UIControlStateNormal];
     [editSubtitles addTarget:self action:@selector(showSubtitleEditor) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:editSubtitles];
+    UIButton *preferences = [UIButton buttonWithType:UIButtonTypeSystem];
+    [preferences setTitle:@"Bảng thuật ngữ và quy tắc thay thế" forState:UIControlStateNormal];
+    [preferences addTarget:self action:@selector(showTranslationPreferences) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:preferences];
     UIButton *stop = [UIButton buttonWithType:UIButtonTypeSystem];
     [stop setTitle:@"Dừng TransDuck" forState:UIControlStateNormal];
     [stop addTarget:self action:@selector(stop) forControlEvents:UIControlEventTouchUpInside];
@@ -938,6 +944,9 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
     TDSubtitleEditor *editor = [TDSubtitleEditor new];
     editor.player = self.player;
     [self.navigationController pushViewController:editor animated:YES];
+}
+- (void)showTranslationPreferences {
+    TDShowTranslationPreferences(self.navigationController, self.languageButton.accessibilityValue ?: @"vi-VN", self.domainButton.accessibilityValue ?: @"general");
 }
 - (void)stop { [[TDManager shared] stop]; }
 @end
