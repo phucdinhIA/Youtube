@@ -1,9 +1,29 @@
 #import "Headers.h"
 #import <os/log.h>
+#import <objc/runtime.h>
+
+static void TDInspectFeedCapabilities(void) {
+    NSArray<NSString *> *names = @[@"reflowedFeedContent:withColumnCount:andReflowOptions:", @"iosDisableResponsiveGridsInPortraitOnHome", @"mainAppCoreClientEnableIosResponsiveGridsHome", @"forceUseCompactGridVideoLayoutOnIpad"];
+    unsigned count = 0;
+    Class *classes = objc_copyClassList(&count);
+    for (unsigned i = 0; i < count; i++) {
+        unsigned methodCount = 0;
+        Method *methods = class_copyMethodList(classes[i], &methodCount);
+        for (unsigned j = 0; j < methodCount; j++) {
+            NSString *name = NSStringFromSelector(method_getName(methods[j]));
+            if (![names containsObject:name]) continue;
+            os_log(OS_LOG_DEFAULT, "[TransDuckFeedMethod] class=%{public}s selector=%{public}s type=%{public}s", class_getName(classes[i]), name.UTF8String, method_getTypeEncoding(methods[j]));
+        }
+        free(methods);
+    }
+    free(classes);
+}
 
 %hook YTInnerTubeCollectionViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
+    static dispatch_once_t inspected;
+    dispatch_once(&inspected, ^{ dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ TDInspectFeedCapabilities(); }); });
     static NSUInteger logged = 0;
     if (logged++ >= 8) return;
     NSMutableArray<UIView *> *views = [NSMutableArray arrayWithObject:self.view];

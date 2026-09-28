@@ -1,6 +1,7 @@
 #import "Headers.h"
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <os/log.h>
 #import "TransDuckVoices.h"
 
@@ -27,8 +28,35 @@ static AVPlayer *TDPlayerInLayer(CALayer *layer) {
     }
     return nil;
 }
+static id TDObjectIvar(id object, const char *name) {
+    if (!object) return nil;
+    Ivar ivar = class_getInstanceVariable(object_getClass(object), name);
+    return ivar ? object_getIvar(object, ivar) : nil;
+}
+static id TDSourceVolumeTarget(YTPlayerViewController *player) {
+    id queuePlayer = TDObjectIvar(player.activeVideo, "_player");
+    id trackRenderer = TDObjectIvar(queuePlayer, "_audioTrackRenderer");
+    id renderer = TDObjectIvar(trackRenderer, "_renderer");
+    if (renderer && [renderer respondsToSelector:@selector(setVolume:)] && [renderer respondsToSelector:@selector(volume)]) return renderer;
+    return TDPlayerInLayer(player.playerView.layer);
+}
+static float TDGetSourceVolume(id target) {
+    return ((float (*)(id, SEL))objc_msgSend)(target, @selector(volume));
+}
+static void TDSetSourceVolume(id target, float volume) {
+    ((void (*)(id, SEL, float))objc_msgSend)(target, @selector(setVolume:), volume);
+}
 static void TDLogPlayerObjects(id object, int depth, int *budget) {
     if (!object || depth < 0 || *budget <= 0) return;
+    unsigned methodCount = 0;
+    Method *methods = class_copyMethodList(object_getClass(object), &methodCount);
+    for (unsigned i = 0; i < methodCount; i++) {
+        NSString *selector = NSStringFromSelector(method_getName(methods[i]));
+        if ([selector localizedCaseInsensitiveContainsString:@"volume"] || [selector localizedCaseInsensitiveContainsString:@"muted"]) {
+            os_log(OS_LOG_DEFAULT, "[TransDuckAudioMethod] class=%{public}s selector=%{public}s type=%{public}s", NSStringFromClass([object class]).UTF8String, selector.UTF8String, method_getTypeEncoding(methods[i]));
+        }
+    }
+    free(methods);
     unsigned count = 0;
     Ivar *ivars = class_copyIvarList(object_getClass(object), &count);
     for (unsigned i = 0; i < count && *budget > 0; i++) {
@@ -38,14 +66,15 @@ static void TDLogPlayerObjects(id object, int depth, int *budget) {
         if (!value) continue;
         NSString *kind = NSStringFromClass([value class]);
         NSString *name = [NSString stringWithUTF8String:ivar_getName(ivars[i])];
-        if (![kind localizedCaseInsensitiveContainsString:@"player"] &&
-            ![kind localizedCaseInsensitiveContainsString:@"audio"] &&
-            ![kind localizedCaseInsensitiveContainsString:@"render"] &&
-            ![name localizedCaseInsensitiveContainsString:@"player"] &&
-            ![name localizedCaseInsensitiveContainsString:@"audio"]) continue;
+        BOOL related = [kind localizedCaseInsensitiveContainsString:@"player"] ||
+            [kind localizedCaseInsensitiveContainsString:@"audio"] ||
+            [kind localizedCaseInsensitiveContainsString:@"render"] ||
+            [name localizedCaseInsensitiveContainsString:@"player"] ||
+            [name localizedCaseInsensitiveContainsString:@"audio"];
+        if (!related && depth != 2) continue;
         (*budget)--;
         os_log(OS_LOG_DEFAULT, "[TransDuckAudioGraph] parent=%{public}s ivar=%{public}s class=%{public}s", NSStringFromClass([object class]).UTF8String, name.UTF8String, kind.UTF8String);
-        if (depth > 0) TDLogPlayerObjects(value, depth - 1, budget);
+        if (depth > 0 && related) TDLogPlayerObjects(value, depth - 1, budget);
     }
     free(ivars);
 }
@@ -173,7 +202,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) NSInteger bufferedCueIndex;
 @property (nonatomic) float speechVolume;
 @property (nonatomic) float originalVolume;
-@property (nonatomic, weak) AVPlayer *volumePlayer;
+@property (nonatomic, weak) id volumeTarget;
 @property (nonatomic) float previousOriginalVolume;
 @property (nonatomic) BOOL loggedMissingOriginalPlayer;
 @property (nonatomic) CFTimeInterval lastOriginalPlayerSearch;
@@ -298,8 +327,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.bufferingSeek = NO;
     self.resumeAfterSeek = NO;
     self.bufferedCueIndex = -1;
-    if (self.volumePlayer) self.volumePlayer.volume = self.previousOriginalVolume;
-    self.volumePlayer = nil;
+    if (self.volumeTarget) TDSetSourceVolume(self.volumeTarget, self.previousOriginalVolume);
+    self.volumeTarget = nil;
     if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
     self.originalMuteCaptured = NO;
     self.mutedVideo = nil;
@@ -768,27 +797,27 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     UIView *playerView = self.player.playerView;
     CFTimeInterval now = CACurrentMediaTime();
     BOOL shouldSearch = playerView != self.searchedPlayerView || now - self.lastOriginalPlayerSearch > 2;
-    if (!shouldSearch && !self.volumePlayer) return;
-    AVPlayer *player = shouldSearch ? TDPlayerInLayer(playerView.layer) : self.volumePlayer;
+    if (!shouldSearch && !self.volumeTarget) return;
+    id target = shouldSearch ? TDSourceVolumeTarget(self.player) : self.volumeTarget;
     if (shouldSearch) { self.searchedPlayerView = playerView; self.lastOriginalPlayerSearch = now; }
-    if (!player) {
-        if (self.volumePlayer) self.volumePlayer.volume = self.previousOriginalVolume;
-        self.volumePlayer = nil;
+    if (!target) {
+        if (self.volumeTarget) TDSetSourceVolume(self.volumeTarget, self.previousOriginalVolume);
+        self.volumeTarget = nil;
         if (!self.loggedMissingOriginalPlayer) {
-            NSLog(@"[TransDuckAudio] original AVPlayer layer unavailable");
+            NSLog(@"[TransDuckAudio] source volume target unavailable");
             int budget = 30;
             TDLogPlayerObjects(self.player.activeVideo, 2, &budget);
             self.loggedMissingOriginalPlayer = YES;
         }
         return;
     }
-    if (player != self.volumePlayer) {
-        if (self.volumePlayer) self.volumePlayer.volume = self.previousOriginalVolume;
-        self.volumePlayer = player;
-        self.previousOriginalVolume = player.volume;
-        NSLog(@"[TransDuckAudio] original AVPlayer found; separate volume enabled");
+    if (target != self.volumeTarget) {
+        if (self.volumeTarget) TDSetSourceVolume(self.volumeTarget, self.previousOriginalVolume);
+        self.volumeTarget = target;
+        self.previousOriginalVolume = TDGetSourceVolume(target);
+        os_log(OS_LOG_DEFAULT, "[TransDuckAudio] target=%{public}s original=%.2f", NSStringFromClass([target class]).UTF8String, self.previousOriginalVolume);
     }
-    player.volume = self.muteOriginal ? 0 : self.originalVolume;
+    TDSetSourceVolume(target, self.muteOriginal ? 0 : self.originalVolume);
 }
 - (void)attachCaptionToPlayerView {
     UIView *view = self.player.playerView;
