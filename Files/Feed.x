@@ -1,5 +1,23 @@
 #import "Headers.h"
 
+%hook YTInnerTubeCollectionViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    static NSUInteger logged = 0;
+    if (logged++ >= 8) return;
+    NSMutableArray<UIView *> *views = [NSMutableArray arrayWithObject:self.view];
+    while (views.count) {
+        UIView *view = views.lastObject;
+        [views removeLastObject];
+        if ([view isKindOfClass:ASCollectionView.class]) {
+            ASCollectionView *collection = (ASCollectionView *)view;
+            NSLog(@"[TransDuckFeed] controller=%@ width=%.0f layout=%@ sections=%ld", NSStringFromClass(self.class), collection.bounds.size.width, NSStringFromClass(collection.collectionViewLayout.class), (long)[collection numberOfSections]);
+        }
+        [views addObjectsFromArray:view.subviews];
+    }
+}
+%end
+
 // Hide Subbar
 %hook YTHeaderContentComboView
 - (void)enableSubheaderBarWithView:(id)arg1 { if (!IS_ENABLED(HideSubbar)) %orig; }

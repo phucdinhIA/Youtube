@@ -26,7 +26,8 @@ static BOOL isReloaded = NO;
 
 %hook YTMainAppVideoPlayerOverlayViewController
 - (void)handleError:(NSError *)error {
-    if (error && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"] && error.code == 14) {
+    if (error) NSLog(@"[TransDuckPlayback] domain=%@ code=%ld description=%@", error.domain, (long)error.code, error.localizedDescription);
+    if (IS_ENABLED(FixPlaybackIssues) && error && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"] && error.code == 14) {
         YTPlayerViewController *playerViewController = self.parentViewController;
         if (![playerViewController.UIDelegate isKindOfClass:%c(YTWatchController)]) return;
         YTWatchController *watchController = (YTWatchController *)playerViewController.UIDelegate;
@@ -40,6 +41,5 @@ static BOOL isReloaded = NO;
 %end
 
 %ctor {
-    if (!IS_ENABLED(FixPlaybackIssues)) return;
     %init;
 }
