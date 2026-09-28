@@ -229,6 +229,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic, strong) NSMutableArray<NSValue *> *speechRanges;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *translationRetries;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *speechRetries;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *audioDownloadRetries;
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
 - (void)checkSession:(void (^)(BOOL))completion;
@@ -252,6 +253,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (BOOL)stopIfVideoChangedAtStage:(const char *)stage;
 - (BOOL)retryRange:(NSRange)range generation:(NSUInteger)generation speech:(BOOL)speech error:(NSError *)error;
 - (void)synthesizeAvailable:(NSUInteger)generation;
+- (void)finishSpeechCueAtIndex:(NSUInteger)index silent:(BOOL)silent;
+- (void)recoverSpeechCueAtIndex:(NSUInteger)index generation:(NSUInteger)generation;
+- (void)retryOrSkipSpeechCueAtIndex:(NSUInteger)index generation:(NSUInteger)generation;
 @end
 
 @implementation TDManager
@@ -368,6 +372,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.synthesisInFlight = 0;
     self.translationRetries = nil;
     self.speechRetries = nil;
+    self.audioDownloadRetries = nil;
     self.startedPlayback = NO;
     self.initialCueIndex = 0;
     self.videoID = nil;
@@ -455,6 +460,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.preparing = YES;
     self.translationRetries = [NSMutableDictionary dictionary];
     self.speechRetries = [NSMutableDictionary dictionary];
+    self.audioDownloadRetries = [NSMutableDictionary dictionary];
     [self showPlayerActivity:YES];
     NSUInteger generation = self.generation;
     self.status = @"Đang tải phụ đề…";
@@ -803,6 +809,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     NSDictionary *cue = self.cues[(NSUInteger)index];
     if (![cue[@"translated"] isKindOfClass:NSString.class]) return NO;
     if (!self.speech) return YES;
+    if ([cue[@"silentVoice"] boolValue]) return YES;
     NSString *url = cue[@"audioURL"];
     return url.length && [self.audioCache objectForKey:url] != nil;
 }
@@ -837,6 +844,45 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.previousTime = -1;
     if (resume && [self.player.currentVideoID isEqualToString:self.videoID]) [self.player play];
 }
+- (void)finishSpeechCueAtIndex:(NSUInteger)index silent:(BOOL)silent {
+    NSMutableDictionary *cue = self.cues[index];
+    if (silent) {
+        cue[@"silentVoice"] = @YES;
+        os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] voice unavailable cue=%lu start=%.2f", (unsigned long)index, [cue[@"start"] doubleValue]);
+    }
+    [cue removeObjectForKey:@"recoveringVoice"];
+    if (![cue[@"countedSpeech"] boolValue]) {
+        cue[@"countedSpeech"] = @YES;
+        self.synthesizedCount++;
+    }
+}
+- (void)retryOrSkipSpeechCueAtIndex:(NSUInteger)index generation:(NSUInteger)generation {
+    NSRange single = NSMakeRange(index, 1);
+    if ([self retryRange:single generation:generation speech:YES error:nil]) return;
+    NSMutableDictionary *cue = self.cues[index];
+    if (![cue[@"fallbackVoice"] boolValue] && [self.targetLanguage.lowercaseString hasPrefix:@"vi"]) {
+        cue[@"fallbackVoice"] = @YES;
+        cue[@"ttsVoice"] = [self.voice isEqualToString:@"vi-VN-HoaiMyNeural"] ? @"vi-VN-NamMinhNeural" : @"vi-VN-HoaiMyNeural";
+        self.speechRetries[@(index)] = @0;
+        os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] alternate Azure voice cue=%lu", (unsigned long)index);
+        if ([self retryRange:single generation:generation speech:YES error:nil]) return;
+    }
+    [self finishSpeechCueAtIndex:index silent:YES];
+    self.status = @"Một câu không có giọng từ máy chủ; phụ đề và phần còn lại vẫn tiếp tục.";
+    if (index == self.initialCueIndex) [self releaseInitialBuffer];
+    [self releaseSeekBufferIfReady];
+    [self synthesizeAvailable:generation];
+}
+- (void)recoverSpeechCueAtIndex:(NSUInteger)index generation:(NSUInteger)generation {
+    if (generation != self.generation || index >= self.cues.count || !self.speech) return;
+    NSMutableDictionary *cue = self.cues[index];
+    if ([cue[@"recoveringVoice"] boolValue]) return;
+    cue[@"recoveringVoice"] = @YES;
+    [cue removeObjectForKey:@"audioURL"];
+    [self.speechRanges insertObject:[NSValue valueWithRange:NSMakeRange(index, 1)] atIndex:0];
+    os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] regenerate expired audio cue=%lu", (unsigned long)index);
+    [self synthesizeAvailable:generation];
+}
 - (void)synthesizeAvailable:(NSUInteger)generation {
     if (generation != self.generation || self.synthesisInFlight >= 2 || !self.speech) return;
     if ([self stopIfVideoChangedAtStage:"tts request"]) return;
@@ -847,13 +893,24 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     NSArray *batch = [self.cues subarrayWithRange:range];
     NSMutableArray *subtitles = [NSMutableArray array];
     for (NSDictionary *cue in batch) [subtitles addObject:@{@"index":cue[@"index"], @"text":cue[@"translated"], @"start":cue[@"start"], @"end":cue[@"end"]}];
-    NSDictionary *body = @{@"subtitles":subtitles, @"config":@{@"model":self.model, @"voice":self.voice, @"voiceType":@"azure", @"toLanguage":self.targetLanguage, @"skipTranslation":@YES}, @"videoDetails":@{@"videoId":self.videoID, @"title":self.videoID, @"subtitleLevel":@2}, @"v2Version":@YES};
+    NSString *voice = range.length == 1 ? (batch.firstObject[@"ttsVoice"] ?: self.voice) : self.voice;
+    NSDictionary *body = @{@"subtitles":subtitles, @"config":@{@"model":self.model, @"voice":voice, @"voiceType":@"azure", @"toLanguage":self.targetLanguage, @"skipTranslation":@YES}, @"videoDetails":@{@"videoId":self.videoID, @"title":self.videoID, @"subtitleLevel":@2}, @"v2Version":@YES};
     [self request:@"/api/v2/dubbing/generateDubbing" method:@"POST" body:body completion:^(id json, NSError *error) {
         if (generation != self.generation) return;
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleDubbingResults"] : nil;
         self.synthesisInFlight--;
         if (error || results.count != batch.count) {
             if ([self retryRange:range generation:generation speech:YES error:error]) return;
+            if (range.length == 1 && (!error || error.code == 408 || error.code == 429 || error.code >= 500 || ![error.domain isEqualToString:@"TransDuck"])) {
+                [self retryOrSkipSpeechCueAtIndex:offset generation:generation];
+                return;
+            }
+            if (range.length > 1 && (!error || error.code == 408 || error.code == 429 || error.code >= 500 || ![error.domain isEqualToString:@"TransDuck"])) {
+                for (NSUInteger i = offset; i < NSMaxRange(range); i++) [self.speechRanges addObject:[NSValue valueWithRange:NSMakeRange(i, 1)]];
+                [self synthesizeAvailable:generation];
+                [self synthesizeAvailable:generation];
+                return;
+            }
             os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] tts failed offset=%lu count=%lu code=%ld results=%lu", (unsigned long)range.location, (unsigned long)range.length, (long)error.code, (unsigned long)results.count);
             self.speech = NO;
             [self.speechRanges removeAllObjects];
@@ -865,29 +922,32 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             self.status = error.localizedDescription ?: @"TTS không đầy đủ; phụ đề vẫn hoạt động.";
             return;
         }
-        BOOL invalidAudio = NO;
+        NSMutableArray<NSNumber *> *invalidCues = [NSMutableArray array];
         for (NSUInteger i = 0; i < batch.count; i++) {
             id value = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"ttsUrl"] : nil;
             NSString *url = [value isKindOfClass:NSString.class] ? value : nil;
-            if ([url hasPrefix:@"https://"] && ![url.lastPathComponent.lowercaseString containsString:@"empty_audio"]) self.cues[offset + i][@"audioURL"] = url;
-            else if ([self.cues[offset + i][@"translated"] length]) invalidAudio = YES;
+            NSUInteger index = offset + i;
+            if ([url hasPrefix:@"https://"] && ![url.lastPathComponent.lowercaseString containsString:@"empty_audio"]) {
+                self.cues[index][@"audioURL"] = url;
+                [self.cues[index] removeObjectForKey:@"silentVoice"];
+                [self finishSpeechCueAtIndex:index silent:NO];
+            } else [invalidCues addObject:@(index)];
         }
-        if (invalidAudio) {
-            if ([self retryRange:range generation:generation speech:YES error:nil]) return;
-            [self fail:@"Một câu TTS chưa tạo được giọng. Hãy thử lại." generation:generation];
-            return;
+        if (invalidCues.count) {
+            os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] invalid TTS cues offset=%lu count=%lu invalid=%lu", (unsigned long)offset, (unsigned long)range.length, (unsigned long)invalidCues.count);
+            if (range.length == 1) [self retryOrSkipSpeechCueAtIndex:offset generation:generation];
+            else for (NSNumber *number in invalidCues) [self.speechRanges addObject:[NSValue valueWithRange:NSMakeRange(number.unsignedIntegerValue, 1)]];
         }
         CGFloat now = self.player.currentVideoMediaTime;
         NSInteger current = 0;
         while (current + 1 < (NSInteger)self.cues.count && [self.cues[(NSUInteger)(current + 1)][@"start"] doubleValue] <= now) current++;
         [self prefetchNearIndex:current];
-        self.synthesizedCount += range.length;
         if (NSLocationInRange(self.initialCueIndex, range)) {
             NSString *initialURL = self.cues[self.initialCueIndex][@"audioURL"];
             if (initialURL.length) {
                 if ([self.audioCache objectForKey:initialURL]) [self releaseInitialBuffer];
                 else [self loadAudioAtIndex:(NSInteger)self.initialCueIndex];
-            } else [self releaseInitialBuffer];
+            } else if ([self.cues[self.initialCueIndex][@"silentVoice"] boolValue]) [self releaseInitialBuffer];
         }
         [self releaseSeekBufferIfReady];
         [self synthesizeAvailable:generation];
@@ -1101,9 +1161,20 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             if (generation != self.generation) return;
             [self.downloads removeObject:urlString];
             if (error || ![http isKindOfClass:NSHTTPURLResponse.class] || http.statusCode != 200 || ![http.URL.scheme isEqualToString:@"https"] || data.length < 1000) {
-                if ((self.preparing && index == (NSInteger)self.initialCueIndex) || (self.bufferingSeek && index == self.bufferedCueIndex)) [self fail:@"Không tải được giọng lồng tiếng cho đoạn đang chờ. Hãy thử lại." generation:generation];
+                if (![self.cues[(NSUInteger)index][@"audioURL"] isEqualToString:urlString]) return;
+                BOOL needed = (self.preparing && index == (NSInteger)self.initialCueIndex) || (self.bufferingSeek && index == self.bufferedCueIndex) || self.activeIndex == index;
+                if (!needed) return;
+                NSUInteger attempt = [self.audioDownloadRetries[urlString] unsignedIntegerValue] + 1;
+                self.audioDownloadRetries[urlString] = @(attempt);
+                os_log(OS_LOG_DEFAULT, "[TransDuckPipeline] audio download failed cue=%ld attempt=%lu http=%ld code=%ld", (long)index, (unsigned long)attempt, (long)http.statusCode, (long)error.code);
+                if (attempt <= 2 && http.statusCode != 403 && http.statusCode != 404) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(attempt * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        if (generation == self.generation) [self loadAudioAtIndex:index];
+                    });
+                } else [self recoverSpeechCueAtIndex:(NSUInteger)index generation:generation];
                 return;
             }
+            [self.audioDownloadRetries removeObjectForKey:urlString];
             [self.audioCache setObject:data forKey:urlString cost:data.length];
             if (self.preparing && index == (NSInteger)self.initialCueIndex) [self releaseInitialBuffer];
             if (self.bufferingSeek && index == self.bufferedCueIndex) [self releaseSeekBufferIfReady];
@@ -1116,7 +1187,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
         AVAudioPlayer *audio = [[AVAudioPlayer alloc] initWithData:data error:&error];
-        if (!audio || error) return;
+        if (!audio || error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (generation == self.generation && self.activeIndex == index) [self recoverSpeechCueAtIndex:(NSUInteger)index generation:generation];
+            });
+            return;
+        }
         audio.enableRate = YES;
         [audio prepareToPlay];
         dispatch_async(dispatch_get_main_queue(), ^{
