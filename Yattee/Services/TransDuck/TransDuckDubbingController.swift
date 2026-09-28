@@ -23,6 +23,7 @@ final class TransDuckDubbingController {
     private var activeVideoID: String?
     private var activeSegmentIndex: Int?
     private var originalVolume: Float?
+    private var translationVolume: Float = 1
     private weak var playerService: PlayerService?
     private(set) var segments: [TransDuckAudioSegment] = []
     private(set) var isPreparing = false
@@ -48,7 +49,9 @@ final class TransDuckDubbingController {
         model: TransDuckModel,
         voice: TransDuckVoice,
         enableSpeech: Bool,
-        originalAudioLevel: Float
+        originalAudioLevel: Float,
+        translationAudioLevel: Float,
+        bilingualSubtitles: Bool
     ) async throws {
         guard !isPreparing else { return }
         stop(restoreVolume: true)
@@ -78,7 +81,7 @@ final class TransDuckDubbingController {
             model: model,
             sourceLanguage: caption?.baseLanguageCode ?? "auto"
         )
-        let subtitleURL = try TransDuckCaptionParser.makeSRT(translated)
+        let subtitleURL = try TransDuckCaptionParser.makeSRT(translated, bilingual: bilingualSubtitles)
         try Task.checkCancellation()
 
         guard playerService.state.currentVideo?.id == video.id else {
@@ -99,6 +102,7 @@ final class TransDuckDubbingController {
             )
             guard playerService.state.currentVideo?.id == video.id else { return }
             segments = generated
+            translationVolume = min(max(translationAudioLevel, 0), 1)
             originalVolume = playerService.state.volume
             let level = min(max(originalAudioLevel, 0), 1)
             playerService.state.volume = level
@@ -181,6 +185,7 @@ final class TransDuckDubbingController {
                 guard currentTime < segment.cue.end else { return }
                 let player = try AVAudioPlayer(data: data)
                 player.enableRate = true
+                player.volume = self.translationVolume
                 player.rate = min(max(Float(playerService.state.rate.rawValue), 0.5), 2)
                 player.prepareToPlay()
                 player.currentTime = min(max(0, currentTime - segment.cue.start), player.duration)

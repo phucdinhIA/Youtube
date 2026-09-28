@@ -22,7 +22,9 @@ struct TransDuckDubbingSheet: View {
     @State private var selectedVoice: TransDuckVoice = .hoaiMy
     @State private var selectedCaptionID = ""
     @State private var enableSpeech = true
+    @State private var bilingualSubtitles = false
     @State private var originalAudioLevel = 0.2
+    @State private var translationAudioLevel = 1.0
     @State private var errorMessage: String?
 
     private var captions: [Caption] { playerService.availableCaptions }
@@ -55,6 +57,7 @@ struct TransDuckDubbingSheet: View {
                         }
                     }
                     LabeledContent("Ngôn ngữ đích", value: "Tiếng Việt")
+                    Toggle("Phụ đề song ngữ", isOn: $bilingualSubtitles)
                 }
 
                 Section("Lồng tiếng") {
@@ -68,6 +71,8 @@ struct TransDuckDubbingSheet: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Âm lượng video gốc: \(Int(originalAudioLevel * 100))%")
                             Slider(value: $originalAudioLevel, in: 0...1)
+                            Text("Âm lượng lồng tiếng: \(Int(translationAudioLevel * 100))%")
+                            Slider(value: $translationAudioLevel, in: 0...1)
                         }
                     }
                 }
@@ -168,7 +173,9 @@ struct TransDuckDubbingSheet: View {
                     model: selectedModel,
                     voice: selectedVoice,
                     enableSpeech: enableSpeech,
-                    originalAudioLevel: Float(originalAudioLevel)
+                    originalAudioLevel: Float(originalAudioLevel),
+                    translationAudioLevel: Float(translationAudioLevel),
+                    bilingualSubtitles: bilingualSubtitles
                 )
             } catch {
                 errorMessage = error.localizedDescription

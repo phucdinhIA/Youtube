@@ -44,4 +44,15 @@ struct TransDuckCaptionParserTests {
         #expect(output.contains("00:00:01,200 --> 00:00:03,450"))
         #expect(output.contains("Xin chào"))
     }
+
+    @Test("Bilingual captions put Vietnamese before the original")
+    func writesBilingualSRT() throws {
+        let cue = TransDuckCue(index: 0, text: "Hello", start: 1, end: 2)
+        let url = try TransDuckCaptionParser.makeSRT([
+            TransDuckTranslation(cue: cue, text: "Xin chào", usedAI: true)
+        ], bilingual: true)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let output = try String(contentsOf: url, encoding: .utf8)
+        #expect(output.contains("Xin chào\nHello"))
+    }
 }

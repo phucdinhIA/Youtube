@@ -52,12 +52,13 @@ enum TransDuckCaptionParser {
         return cues
     }
 
-    static func makeSRT(_ translations: [TransDuckTranslation]) throws -> URL {
+    static func makeSRT(_ translations: [TransDuckTranslation], bilingual: Bool = false) throws -> URL {
         guard !translations.isEmpty else { throw TransDuckError.noCaptions }
         let body = translations.enumerated().map { offset, item in
             let safeText = item.text.replacingOccurrences(of: "\r", with: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return "\(offset + 1)\n\(srtTime(item.cue.start)) --> \(srtTime(item.cue.end))\n\(safeText)\n"
+            let subtitleText = bilingual ? "\(safeText)\n\(item.cue.text)" : safeText
+            return "\(offset + 1)\n\(srtTime(item.cue.start)) --> \(srtTime(item.cue.end))\n\(subtitleText)\n"
         }.joined(separator: "\n")
 
         let directory = FileManager.default.temporaryDirectory
