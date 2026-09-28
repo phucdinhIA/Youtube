@@ -16,14 +16,20 @@ static CGFloat TDPlaybackRate(YTPlayerViewController *player) {
     CGFloat rate = [(YTMainAppVideoPlayerOverlayViewController *)overlay currentPlaybackRate];
     return isfinite(rate) && rate > 0 ? MIN(2, MAX(0.5, rate)) : 1;
 }
-static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, CGFloat videoTime, CGFloat playbackRate) {
-    CGFloat remainingVideo = [cue[@"end"] doubleValue] - videoTime;
+static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, NSDictionary *nextCue, CGFloat videoTime, CGFloat playbackRate) {
+    CGFloat deadline = [cue[@"end"] doubleValue];
+    CGFloat nextStart = [nextCue[@"start"] doubleValue];
+    if (nextCue && nextStart > [cue[@"start"] doubleValue] && nextStart <= deadline + 0.35)
+        deadline = nextStart;
+    CGFloat remainingVideo = deadline - videoTime;
     CGFloat remainingSpeech = audio.duration - audio.currentTime;
     if (!isfinite(remainingVideo) || !isfinite(remainingSpeech) || remainingSpeech <= 0) return 1;
-    // Keep the complete phrase audible. The extension caps voice acceleration
-    // and waits for the audio end event before starting the next phrase.
-    if (remainingVideo <= 0) return 1.4 / MAX(0.5, playbackRate);
-    return MIN(MAX(1, remainingSpeech / remainingVideo), 1.4 / MAX(0.5, playbackRate));
+    // Plan against the next phrase's entrance, not a caption end that overlaps it.
+    // Keep the whole phrase and limit the voice speed to a modest 1.6x.
+    CGFloat ceiling = MIN(2, MAX(1.6, playbackRate));
+    CGFloat desiredRate = remainingVideo > 0 ?
+        remainingSpeech * playbackRate / remainingVideo : ceiling;
+    return MIN(MAX(playbackRate, desiredRate), ceiling) / playbackRate;
 }
 static AVPlayer *TDPlayerInLayer(CALayer *layer) {
     if ([layer isKindOfClass:AVPlayerLayer.class] && ((AVPlayerLayer *)layer).player) return ((AVPlayerLayer *)layer).player;
@@ -1232,7 +1238,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
                 self.preparedAudioIndex = -1;
                 NSDictionary *upcomingCue = self.cues[(NSUInteger)upcoming];
                 CGFloat rate = TDPlaybackRate(player);
-                CGFloat stretch = TDSpeechStretch(nextAudio, upcomingCue, time, rate);
+                NSDictionary *followingCue = upcoming + 1 < (NSInteger)self.cues.count ?
+                    self.cues[(NSUInteger)(upcoming + 1)] : nil;
+                CGFloat stretch = TDSpeechStretch(nextAudio, upcomingCue, followingCue, time, rate);
                 nextAudio.currentTime = 0;
                 nextAudio.rate = stretch * rate;
                 nextAudio.volume = 0;
@@ -1382,7 +1390,9 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         return;
     }
     CGFloat playbackRate = TDPlaybackRate(self.player);
-    CGFloat stretch = TDSpeechStretch(audio, cue, now, playbackRate);
+    NSDictionary *followingCue = index + 1 < (NSInteger)self.cues.count ?
+        self.cues[(NSUInteger)(index + 1)] : nil;
+    CGFloat stretch = TDSpeechStretch(audio, cue, followingCue, now, playbackRate);
     audio.currentTime = 0;
     audio.rate = stretch * playbackRate;
     audio.volume = self.speechVolume;
@@ -1394,7 +1404,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     BOOL started = self.advancing && self.player.playerState == 3 && [audio play];
     self.audioHasStarted = started;
     if (started) [self.cues[(NSUInteger)index] removeObjectForKey:@"audioRecoveryAttempts"];
-    os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f rate=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], audio.rate, audio.volume, started);
+    os_log(OS_LOG_DEFAULT, "[TransDuckVoice] cue=%ld duration=%.2f interval=%.2f late=%.2f rate=%.2f volume=%.2f started=%d", (long)index, audio.duration, [cue[@"end"] doubleValue] - [cue[@"start"] doubleValue], MAX(0, now - start), audio.rate, audio.volume, started);
     [self prepareUpcomingAudio];
 }
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
