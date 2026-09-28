@@ -18,7 +18,8 @@ static CGFloat TDPlaybackRate(YTPlayerViewController *player) {
 static CGFloat TDSpeechStretch(AVAudioPlayer *audio, NSDictionary *cue, CGFloat videoTime, CGFloat playbackRate) {
     CGFloat remainingVideo = [cue[@"end"] doubleValue] - videoTime;
     CGFloat remainingSpeech = audio.duration - audio.currentTime;
-    if (!isfinite(remainingVideo) || !isfinite(remainingSpeech) || remainingVideo <= 0 || remainingSpeech <= 0) return 1;
+    if (!isfinite(remainingVideo) || !isfinite(remainingSpeech) || remainingSpeech <= 0) return 1;
+    if (remainingVideo <= 0) return 1.6 / MAX(0.5, playbackRate);
     // Catch up when a voice starts late without repeatedly pausing the video.
     return MIN(MAX(1, remainingSpeech / remainingVideo), 1.6 / MAX(0.5, playbackRate));
 }
@@ -205,6 +206,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) BOOL bufferingSeek;
 @property (nonatomic) BOOL resumeAfterSeek;
 @property (nonatomic) NSInteger bufferedCueIndex;
+@property (nonatomic) BOOL bufferedSequentialCue;
 @property (nonatomic) float speechVolume;
 @property (nonatomic) float originalVolume;
 @property (nonatomic, weak) id volumeTarget;
@@ -333,6 +335,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.bufferingSeek = NO;
     self.resumeAfterSeek = NO;
     self.bufferedCueIndex = -1;
+    self.bufferedSequentialCue = NO;
     if (self.volumeTarget) TDSetSourceVolume(self.volumeTarget, self.previousOriginalVolume);
     self.volumeTarget = nil;
     if (self.originalMuteCaptured && self.mutedVideo) [self.mutedVideo setMuted:self.originalMuted];
@@ -711,6 +714,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)releaseSeekBufferIfReady {
     if (!self.bufferingSeek || ![self cueReadyAtIndex:self.bufferedCueIndex]) return;
     os_log(OS_LOG_DEFAULT, "[TransDuckVoice] buffer ready cue=%ld", (long)self.bufferedCueIndex);
+    if (self.bufferedSequentialCue) self.activeIndex = self.bufferedCueIndex - 1;
+    self.bufferedSequentialCue = NO;
     self.bufferingSeek = NO;
     [self showPlayerActivity:NO];
     BOOL resume = self.resumeAfterSeek;
@@ -877,29 +882,34 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if (self.preparing) { [self showPlayerActivity:YES]; return; }
     }
     if (self.audioPlayer && !self.audioPlayer.isPlaying && self.audioPlayer.currentTime >= self.audioPlayer.duration - 0.05) self.audioFinished = YES;
-    BOOL missingVoice = self.speech && target >= 0 && ![self cueReadyAtIndex:target];
+    NSInteger speechTarget = found;
+    if (!jumped && self.activeIndex >= 0 && self.activeIndex + 1 < next && (!self.audioPlayer || self.audioFinished)) speechTarget = self.activeIndex + 1;
+    NSInteger waitTarget = jumped && speechTarget < 0 ? target : speechTarget;
+    BOOL missingVoice = self.speech && waitTarget >= 0 && ![self cueReadyAtIndex:waitTarget];
     BOOL needsBuffer = missingVoice && (jumped || self.bufferingSeek || (found >= 0 && (!self.audioPlayer || self.audioFinished)));
     if (needsBuffer && !self.bufferingSeek) {
         self.bufferingSeek = YES;
-        self.bufferedCueIndex = target;
+        self.bufferedCueIndex = waitTarget;
+        self.bufferedSequentialCue = !jumped && speechTarget != found;
         self.resumeAfterSeek = player.playerState == 3;
         [self.audioPlayer stop];
         self.audioPlayer = nil;
         self.audioFinished = NO;
         self.activeIndex = -1;
         self.status = @"Đang chuẩn bị giọng lồng tiếng…";
-        os_log(OS_LOG_DEFAULT, "[TransDuckVoice] buffer start cue=%ld seek=%d", (long)target, jumped);
+        os_log(OS_LOG_DEFAULT, "[TransDuckVoice] buffer start cue=%ld seek=%d", (long)waitTarget, jumped);
     }
     if (self.bufferingSeek) {
         if (player.playerState == 3) {
             self.resumeAfterSeek = YES;
             [player pause];
         }
-        if (target != self.bufferedCueIndex) {
+        if (jumped && target != self.bufferedCueIndex) {
             self.bufferedCueIndex = target;
+            self.bufferedSequentialCue = NO;
             os_log(OS_LOG_DEFAULT, "[TransDuckVoice] buffer target cue=%ld", (long)target);
         }
-        if (target >= 0) [self prefetchNearIndex:target];
+        if (self.bufferedCueIndex >= 0) [self prefetchNearIndex:self.bufferedCueIndex];
         [self releaseSeekBufferIfReady];
         if (self.bufferingSeek) { [self showPlayerActivity:YES]; return; }
     }
@@ -924,21 +934,21 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     }
     // The active index is the last narrated cue. An earlier overlapping cue
     // can become visible again, but its audio must not be started twice.
-    if (found <= self.activeIndex) {
+    if (speechTarget <= self.activeIndex) {
         [self prefetchNearIndex:found >= 0 ? found : next];
         return;
     }
     [self.audioPlayer stop];
     self.audioPlayer = nil;
     self.audioFinished = NO;
-    self.activeIndex = found;
-    [self prefetchNearIndex:found];
+    self.activeIndex = speechTarget;
+    [self prefetchNearIndex:speechTarget];
     if (!self.speech) return;
-    NSString *urlString = self.cues[(NSUInteger)found][@"audioURL"];
+    NSString *urlString = self.cues[(NSUInteger)speechTarget][@"audioURL"];
     if (!urlString) return;
     NSData *cached = [self.audioCache objectForKey:urlString];
-    if (cached) { [self playData:cached index:found]; return; }
-    [self loadAudioAtIndex:found];
+    if (cached) { [self playData:cached index:speechTarget]; return; }
+    [self loadAudioAtIndex:speechTarget];
 }
 - (void)prefetchNearIndex:(NSInteger)index {
     if (!self.speech || !self.cues.count) return;
