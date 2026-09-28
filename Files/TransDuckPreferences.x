@@ -14,7 +14,7 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Quy tắc dịch";
-    self.mode = [[UISegmentedControl alloc] initWithItems:@[@"Thuật ngữ", @"Thay thế"]];
+    self.mode = [[UISegmentedControl alloc] initWithItems:@[@"Thuật ngữ", @"Thay thế", @"Sau dịch"]];
     self.mode.selectedSegmentIndex = 0;
     [self.mode addTarget:self action:@selector(reloadRules) forControlEvents:UIControlEventValueChanged];
     self.navigationItem.titleView = self.mode;
@@ -33,7 +33,8 @@
     [self reloadRules];
 }
 - (BOOL)isGlossary { return self.mode.selectedSegmentIndex == 0; }
-- (NSString *)resource { return [self isGlossary] ? @"glossary" : @"replacement"; }
+- (BOOL)isPostTranslation { return self.mode.selectedSegmentIndex == 2; }
+- (NSString *)resource { return [self isGlossary] ? @"glossary" : ([self isPostTranslation] ? @"translated-text-replacement" : @"replacement"); }
 - (void)request:(NSString *)method path:(NSString *)path body:(NSDictionary *)body completion:(void (^)(id, NSError *))completion {
     NSURL *url = [NSURL URLWithString:[@"https://yd.transduck.com" stringByAppendingString:path]];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
@@ -64,6 +65,7 @@
     [self.tableView reloadData];
     self.messageLabel.text = @"Đang tải quy tắc…";
     NSString *resource = self.resource;
+    if ([self isPostTranslation]) { [self loadTranslatedPageAfter:0 collected:@[] resource:resource]; return; }
     [self request:@"GET" path:[@"/api/v2/translate-preference/" stringByAppendingString:resource] body:nil completion:^(id json, NSError *error) {
         if (![resource isEqualToString:self.resource]) return;
         NSArray *data = [json isKindOfClass:NSDictionary.class] ? json[@"data"] : nil;
@@ -78,6 +80,29 @@
         self.items = filtered;
         self.messageLabel.text = filtered.count ? @"" : @"Chưa có quy tắc trong lĩnh vực và ngôn ngữ này.";
         [self.tableView reloadData];
+    }];
+}
+- (void)loadTranslatedPageAfter:(NSInteger)afterID collected:(NSArray<NSDictionary *> *)collected resource:(NSString *)resource {
+    NSURLComponents *parts = [NSURLComponents componentsWithString:@"https://yd.transduck.com/api/v2/translate-preference/translated-text-replacement-page"];
+    parts.queryItems = @[
+        [NSURLQueryItem queryItemWithName:@"toLanguage" value:self.language],
+        [NSURLQueryItem queryItemWithName:@"domain" value:self.domain],
+        [NSURLQueryItem queryItemWithName:@"afterId" value:[NSString stringWithFormat:@"%ld", (long)afterID]],
+        [NSURLQueryItem queryItemWithName:@"limit" value:@"200"]
+    ];
+    NSString *path = [parts.URL.absoluteString substringFromIndex:@"https://yd.transduck.com".length];
+    [self request:@"GET" path:path body:nil completion:^(id json, NSError *error) {
+        if (![resource isEqualToString:self.resource]) return;
+        NSDictionary *data = [json isKindOfClass:NSDictionary.class] ? json[@"data"] : nil;
+        NSArray *page = [data isKindOfClass:NSDictionary.class] ? data[@"items"] : nil;
+        if (error || ![page isKindOfClass:NSArray.class]) { self.messageLabel.text = error.localizedDescription ?: @"Không tải được quy tắc."; return; }
+        NSMutableArray *all = [collected mutableCopy];
+        for (NSDictionary *item in page) if ([item isKindOfClass:NSDictionary.class]) [all addObject:item];
+        self.items = all;
+        self.messageLabel.text = all.count ? @"" : @"Chưa có quy tắc sau dịch.";
+        [self.tableView reloadData];
+        NSInteger next = [data[@"nextAfterId"] integerValue];
+        if ([data[@"hasMore"] boolValue] && next > afterID) [self loadTranslatedPageAfter:next collected:all resource:resource];
     }];
 }
 - (NSInteger)tableView:(__unused UITableView *)tableView numberOfRowsInSection:(__unused NSInteger)section { return self.items.count; }
@@ -102,6 +127,7 @@
 - (void)addRule { [self showEditorForItem:nil]; }
 - (NSDictionary *)bodyWithSource:(NSString *)source target:(NSString *)target enabled:(BOOL)enabled {
     if ([self isGlossary]) return @{@"domain":self.domain, @"toLanguage":self.language, @"sourceTerm":source, @"targetTerm":target, @"enabled":@(enabled)};
+    if ([self isPostTranslation]) return @{@"domain":self.domain, @"toLanguage":self.language, @"findText":source, @"replaceText":target, @"enabled":@(enabled)};
     return @{@"domain":self.domain, @"findText":source, @"replaceText":target, @"enabled":@(enabled)};
 }
 - (void)showEditorForItem:(NSDictionary *)item {
