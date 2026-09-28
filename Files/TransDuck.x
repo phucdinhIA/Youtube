@@ -1,5 +1,6 @@
 #import "Headers.h"
 #import <AVFoundation/AVFoundation.h>
+#import <float.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <os/log.h>
@@ -403,6 +404,13 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if (![self.player.currentVideoID isEqualToString:videoID]) { [self stop]; return; }
         if (error || !cues.count) { [self fail:error.localizedDescription ?: @"Video chưa có phụ đề khả dụng trên TransDuck." generation:generation]; return; }
         self.cues = [cues mutableCopy];
+        double previousEnd = 0;
+        os_log(OS_LOG_DEFAULT, "[TransDuckCaptions] selected video=%{public}s cues=%lu largestGap=%.1f", videoID.UTF8String, (unsigned long)cues.count, [self largestCaptionGap:cues]);
+        for (NSDictionary *cue in cues) {
+            double start = [cue[@"start"] doubleValue], end = [cue[@"end"] doubleValue];
+            if (previousEnd > 0 && start - previousEnd > 12) os_log(OS_LOG_DEFAULT, "[TransDuckCaptions] gap video=%{public}s from=%.1f to=%.1f", videoID.UTF8String, previousEnd, start);
+            previousEnd = MAX(previousEnd, end);
+        }
         NSMutableArray<NSNumber *> *maxEnds = [NSMutableArray arrayWithCapacity:cues.count];
         double latestEnd = 0;
         for (NSDictionary *cue in cues) {
@@ -440,7 +448,18 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     NSString *path = [parts.URL.absoluteString substringFromIndex:TDBaseURL.length];
     [self request:path method:@"GET" body:nil completion:^(id json, NSError *error) {
         NSArray *parsed = !error && [json isKindOfClass:NSArray.class] ? [self parseCaptionItems:json] : @[];
-        if (parsed.count) { completion(parsed, nil); return; }
+        if (parsed.count) {
+            double gap = [self largestCaptionGap:parsed];
+            if (gap <= 12) { completion(parsed, nil); return; }
+            [self fetchNativeCaptionsForVideo:videoID player:player completion:^(NSArray<NSMutableDictionary *> *native, __unused NSError *nativeError) {
+                double nativeGap = [self largestCaptionGap:native];
+                if (native.count && native.count >= parsed.count / 2 && nativeGap < gap) {
+                    os_log(OS_LOG_DEFAULT, "[TransDuckCaptions] native track repaired backend gap %.1f to %.1f video=%{public}s", gap, nativeGap, videoID.UTF8String);
+                    completion(native, nil);
+                } else completion(parsed, nil);
+            }];
+            return;
+        }
         [self fetchNativeCaptionsForVideo:videoID player:player completion:completion];
     }];
 }
@@ -496,12 +515,29 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self fetchNativeCaptionTrackAtIndex:0 tracks:tracks videoID:videoID player:player completion:completion];
 }
 - (void)fetchNativeCaptionTrackAtIndex:(NSUInteger)index tracks:(NSArray<YTICaptionTrackEntry *> *)tracks videoID:(NSString *)videoID player:(YTPlayerViewController *)player completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
-    if (index >= tracks.count) { NSLog(@"[TransDuckCaptions] all native tracks failed video=%@", videoID); completion(nil, [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"YouTube có track phụ đề nhưng không tải được nội dung."}]); return; }
+    [self fetchNativeCaptionTrackAtIndex:index tracks:tracks videoID:videoID player:player best:nil bestGap:DBL_MAX completion:completion];
+}
+- (double)largestCaptionGap:(NSArray<NSDictionary *> *)cues {
+    double latestEnd = 0, largest = 0;
+    for (NSDictionary *cue in cues) {
+        double start = [cue[@"start"] doubleValue], end = [cue[@"end"] doubleValue];
+        if (latestEnd > 0) largest = MAX(largest, start - latestEnd);
+        latestEnd = MAX(latestEnd, end);
+    }
+    return largest;
+}
+- (void)fetchNativeCaptionTrackAtIndex:(NSUInteger)index tracks:(NSArray<YTICaptionTrackEntry *> *)tracks videoID:(NSString *)videoID player:(YTPlayerViewController *)player best:(NSArray<NSMutableDictionary *> *)best bestGap:(double)bestGap completion:(void (^)(NSArray<NSMutableDictionary *> *, NSError *))completion {
+    if (index >= MIN(tracks.count, 6)) {
+        if (best.count) { completion(best, nil); return; }
+        NSLog(@"[TransDuckCaptions] all native tracks failed video=%@", videoID);
+        completion(nil, [NSError errorWithDomain:@"TransDuck" code:404 userInfo:@{NSLocalizedDescriptionKey:@"YouTube có track phụ đề nhưng không tải được nội dung."}]);
+        return;
+    }
     NSString *baseURL = tracks[index].baseURL;
     NSURLComponents *parts = [NSURLComponents componentsWithString:baseURL];
     NSString *host = parts.host.lowercaseString;
     if (![parts.scheme.lowercaseString isEqualToString:@"https"] || !([host isEqualToString:@"youtube.com"] || [host hasSuffix:@".youtube.com"])) {
-        [self fetchNativeCaptionTrackAtIndex:index + 1 tracks:tracks videoID:videoID player:player completion:completion];
+        [self fetchNativeCaptionTrackAtIndex:index + 1 tracks:tracks videoID:videoID player:player best:best bestGap:bestGap completion:completion];
         return;
     }
     NSMutableArray<NSURLQueryItem *> *items = [NSMutableArray array];
@@ -515,8 +551,16 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSArray *cues = !error && [http isKindOfClass:NSHTTPURLResponse.class] && http.statusCode == 200 && data.length ? [self parseNativeCaptionJSON:data] : @[];
         if (!cues.count) NSLog(@"[TransDuckCaptions] track=%lu http=%ld bytes=%lu error=%@", (unsigned long)index, (long)http.statusCode, (unsigned long)data.length, error.localizedDescription);
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (cues.count) completion(cues, nil);
-            else [self fetchNativeCaptionTrackAtIndex:index + 1 tracks:tracks videoID:videoID player:player completion:completion];
+            double gap = cues.count ? [self largestCaptionGap:cues] : DBL_MAX;
+            os_log(OS_LOG_DEFAULT, "[TransDuckCaptions] video=%{public}s track=%lu language=%{public}s cues=%lu largestGap=%.1f", videoID.UTF8String, (unsigned long)index, tracks[index].languageCode.UTF8String, (unsigned long)cues.count, gap);
+            NSArray *candidate = best;
+            double candidateGap = bestGap;
+            if (cues.count && (!best.count || (cues.count >= best.count / 2 && gap < bestGap))) {
+                candidate = cues;
+                candidateGap = gap;
+            }
+            if (candidate.count && candidateGap <= 12) completion(candidate, nil);
+            else [self fetchNativeCaptionTrackAtIndex:index + 1 tracks:tracks videoID:videoID player:player best:candidate bestGap:candidateGap completion:completion];
         });
     }] resume];
 }
