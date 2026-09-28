@@ -1,0 +1,38 @@
+name: Build TransDuck YouTube tweak
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [transduck-youtube-native]
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: brew install make ldid
+      - name: Set up Theos and iOS SDK
+        run: |
+          set -euo pipefail
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          git clone --quiet --depth=1 --recurse-submodules https://github.com/roothide/theos.git "$RUNNER_TEMP/theos"
+          git clone --quiet --depth=1 -n --filter=tree:0 https://github.com/Tonwalter888/iOS-SDKs.git "$RUNNER_TEMP/iOS-SDKs"
+          cd "$RUNNER_TEMP/iOS-SDKs"
+          git sparse-checkout set --no-cone iPhoneOS26.5.sdk
+          git checkout --quiet
+          mv *.sdk "$RUNNER_TEMP/theos/sdks/"
+          git clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git "$RUNNER_TEMP/theos/include/YouTubeHeader"
+          git clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git "$RUNNER_TEMP/theos/include/PSHeader"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+      - name: Build arm64 tweak
+        run: |
+          set -euo pipefail
+          make clean package DEBUG=0 FINALPACKAGE=1
+          test -f packages/dev.water888.youmod_2.0.0_iphoneos-arm.deb
+          dpkg-deb --contents packages/dev.water888.youmod_2.0.0_iphoneos-arm.deb | grep YouMod.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TransDuck-YouMod-arm64
+          path: packages/*iphoneos-arm.deb
+          if-no-files-found: error
