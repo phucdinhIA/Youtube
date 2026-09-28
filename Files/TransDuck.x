@@ -192,6 +192,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) NSUInteger generation;
 @property (nonatomic) NSInteger activeIndex;
 @property (nonatomic) CGFloat previousTime;
+@property (nonatomic) NSInteger lastCaptionDiagnosticSecond;
 @property (nonatomic) BOOL advancing;
 @property (nonatomic) BOOL speech;
 @property (nonatomic) BOOL bilingual;
@@ -350,6 +351,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     self.speechRanges = nil;
     [self.downloads removeAllObjects];
     self.activeIndex = -1;
+    self.lastCaptionDiagnosticSecond = -1;
     self.preparing = NO;
     self.translatedCount = 0;
     self.synthesizedCount = 0;
@@ -409,6 +411,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         for (NSDictionary *cue in cues) {
             double start = [cue[@"start"] doubleValue], end = [cue[@"end"] doubleValue];
             if (previousEnd > 0 && start - previousEnd > 12) os_log(OS_LOG_DEFAULT, "[TransDuckCaptions] gap video=%{public}s from=%.1f to=%.1f", videoID.UTF8String, previousEnd, start);
+            if ([videoID isEqualToString:@"Cn9nd-DDNVg"] && end >= 158 && start <= 202) os_log(OS_LOG_DEFAULT, "[TransDuckCaptions] cue=%lu from=%.1f to=%.1f", (unsigned long)[cue[@"index"] unsignedIntegerValue], start, end);
             previousEnd = MAX(previousEnd, end);
         }
         NSMutableArray<NSNumber *> *maxEnds = [NSMutableArray arrayWithCapacity:cues.count];
@@ -914,6 +917,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         if ([self.cues[(NSUInteger)i][@"end"] doubleValue] > time) { found = i; break; }
     }
     NSInteger target = found >= 0 ? found : (next < (NSInteger)self.cues.count && [self.cues[(NSUInteger)next][@"start"] doubleValue] - time < 2 ? next : -1);
+    NSInteger second = (NSInteger)floor(time);
+    if ([self.videoID isEqualToString:@"Cn9nd-DDNVg"] && second >= 155 && second <= 205 && second != self.lastCaptionDiagnosticSecond) {
+        self.lastCaptionDiagnosticSecond = second;
+        NSDictionary *cue = found >= 0 ? self.cues[(NSUInteger)found] : nil;
+        os_log(OS_LOG_DEFAULT, "[TransDuckTimeline] time=%.2f found=%ld next=%ld active=%ld translated=%d tts=%d cached=%d captions=%d label=%d playerState=%ld buffering=%d", time, (long)found, (long)next, (long)self.activeIndex, cue[@"translated"] != nil, cue[@"audioURL"] != nil, cue[@"audioURL"] && [self.audioCache objectForKey:cue[@"audioURL"]] != nil, self.showCaptions, self.captionLabel.superview != nil, (long)player.playerState, self.bufferingSeek);
+    }
     if (jumped && !self.preparing) {
         [self.audioPlayer stop];
         self.audioPlayer = nil;
