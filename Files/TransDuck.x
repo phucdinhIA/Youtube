@@ -99,6 +99,11 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 @property (nonatomic) BOOL originalMuteCaptured;
 @property (nonatomic) BOOL preparing;
 @property (nonatomic) float speechVolume;
+@property (nonatomic) NSUInteger translatedCount;
+@property (nonatomic) NSUInteger synthesizedCount;
+@property (nonatomic) BOOL translationComplete;
+@property (nonatomic) BOOL synthesisInFlight;
+@property (nonatomic) BOOL startedPlayback;
 @property (nonatomic, strong) NSMutableSet<NSString *> *downloads;
 + (instancetype)shared;
 - (void)login:(NSString *)email password:(NSString *)password completion:(void (^)(NSError *))completion;
@@ -196,6 +201,11 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self.downloads removeAllObjects];
     self.activeIndex = -1;
     self.preparing = NO;
+    self.translatedCount = 0;
+    self.synthesizedCount = 0;
+    self.translationComplete = NO;
+    self.synthesisInFlight = NO;
+    self.startedPlayback = NO;
     self.videoID = nil;
     self.player = nil;
     self.status = @"Đã dừng.";
@@ -293,11 +303,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 - (void)translateFrom:(NSUInteger)offset generation:(NSUInteger)generation {
     if (generation != self.generation) return;
     if (offset >= self.cues.count) {
-        [self beginPlayback:generation];
-        if (self.speech) {
-            self.status = [NSString stringWithFormat:@"Đang tạo giọng %@…", self.voice];
-            [self synthesizeFrom:0 generation:generation];
-        } else { self.preparing = NO; self.status = @"Phụ đề tiếng Việt đã sẵn sàng."; }
+        self.translationComplete = YES;
+        [self finishIfReady];
         return;
     }
     NSRange range = NSMakeRange(offset, MIN([self.model isEqualToString:@"google"] ? 50 : 10, self.cues.count - offset));
@@ -316,7 +323,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
                 NSString *text = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"text"] : nil;
                 self.cues[offset + i][@"translated"] = text.length ? text : batch[i][@"text"];
             }
-            [self translateFrom:NSMaxRange(range) generation:generation];
+            [self translatedThrough:NSMaxRange(range) generation:generation];
         }];
         return;
     }
@@ -333,13 +340,29 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
             NSString *text = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"translateResult"] : nil;
             self.cues[offset + i][@"translated"] = text.length ? text : batch[i][@"text"];
         }
-        [self translateFrom:NSMaxRange(range) generation:generation];
+        [self translatedThrough:NSMaxRange(range) generation:generation];
     }];
 }
-- (void)synthesizeFrom:(NSUInteger)offset generation:(NSUInteger)generation {
+- (void)translatedThrough:(NSUInteger)offset generation:(NSUInteger)generation {
     if (generation != self.generation) return;
-    if (offset >= self.cues.count) { self.preparing = NO; self.status = @"Phụ đề và lồng tiếng đã sẵn sàng."; return; }
-    NSRange range = NSMakeRange(offset, MIN(10, self.cues.count - offset));
+    self.translatedCount = offset;
+    if (!self.startedPlayback) { self.startedPlayback = YES; [self beginPlayback:generation]; }
+    if (self.speech) [self synthesizeAvailable:generation];
+    self.status = [NSString stringWithFormat:@"Đã dịch %lu/%lu câu · đang chuẩn bị giọng…", (unsigned long)offset, (unsigned long)self.cues.count];
+    [self translateFrom:offset generation:generation];
+}
+- (void)finishIfReady {
+    if (!self.translationComplete) return;
+    if (self.speech && (self.synthesisInFlight || self.synthesizedCount < self.cues.count)) return;
+    self.preparing = NO;
+    self.status = self.speech ? @"Phụ đề và lồng tiếng đã sẵn sàng." : @"Phụ đề đã sẵn sàng.";
+}
+- (void)synthesizeAvailable:(NSUInteger)generation {
+    if (generation != self.generation || self.synthesisInFlight || !self.speech) return;
+    NSUInteger offset = self.synthesizedCount;
+    if (offset >= self.translatedCount) { [self finishIfReady]; return; }
+    self.synthesisInFlight = YES;
+    NSRange range = NSMakeRange(offset, MIN(10, self.translatedCount - offset));
     NSArray *batch = [self.cues subarrayWithRange:range];
     NSMutableArray *subtitles = [NSMutableArray array];
     for (NSDictionary *cue in batch) [subtitles addObject:@{@"index":cue[@"index"], @"text":cue[@"translated"], @"start":cue[@"start"], @"end":cue[@"end"]}];
@@ -347,7 +370,15 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
     [self request:@"/api/v2/dubbing/generateDubbing" method:@"POST" body:body completion:^(id json, NSError *error) {
         if (generation != self.generation) return;
         NSArray *results = [json isKindOfClass:NSDictionary.class] ? json[@"subtitleDubbingResults"] : nil;
-        if (error || results.count != batch.count) { self.preparing = NO; self.status = error.localizedDescription ?: @"TTS không đầy đủ; phụ đề vẫn hoạt động."; return; }
+        self.synthesisInFlight = NO;
+        if (error || results.count != batch.count) {
+            self.speech = NO;
+            if (self.originalMuteCaptured && self.player.activeVideo) [self.player.activeVideo setMuted:self.originalMuted];
+            self.originalMuteCaptured = NO;
+            [self finishIfReady];
+            self.status = error.localizedDescription ?: @"TTS không đầy đủ; phụ đề vẫn hoạt động.";
+            return;
+        }
         for (NSUInteger i = 0; i < batch.count; i++) {
             id value = [results[i] isKindOfClass:NSDictionary.class] ? results[i][@"ttsUrl"] : nil;
             NSString *url = [value isKindOfClass:NSString.class] ? value : nil;
@@ -358,7 +389,8 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         NSInteger current = 0;
         while (current + 1 < (NSInteger)self.cues.count && [self.cues[(NSUInteger)(current + 1)][@"start"] doubleValue] <= now) current++;
         [self prefetchNearIndex:current];
-        [self synthesizeFrom:NSMaxRange(range) generation:generation];
+        self.synthesizedCount = NSMaxRange(range);
+        [self synthesizeAvailable:generation];
     }];
 }
 - (void)beginPlayback:(NSUInteger)generation {
@@ -404,13 +436,12 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
         else if (time >= [cue[@"end"] doubleValue]) low = middle + 1;
         else { found = middle; break; }
     }
-    if (found != self.activeIndex) {
-        self.captionLabel.hidden = found < 0;
-        if (found >= 0) {
-            NSDictionary *cue = self.cues[(NSUInteger)found];
-            NSString *translated = cue[@"translated"] ?: @"";
-            self.captionLabel.text = self.bilingual ? [NSString stringWithFormat:@"%@\n%@", translated, cue[@"text"]] : translated;
-        }
+    self.captionLabel.hidden = found < 0;
+    if (found >= 0) {
+        NSDictionary *cue = self.cues[(NSUInteger)found];
+        NSString *translated = cue[@"translated"] ?: cue[@"text"];
+        NSString *display = self.bilingual && cue[@"translated"] ? [NSString stringWithFormat:@"%@\n%@", translated, cue[@"text"]] : translated;
+        if (![self.captionLabel.text isEqualToString:display]) self.captionLabel.text = display;
     }
     if (!advancing) { [self.audioPlayer pause]; return; }
     if (found == self.activeIndex) {
