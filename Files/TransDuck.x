@@ -69,6 +69,7 @@ static NSArray<NSDictionary *> *TDLanguages(void) {
 
 @interface TDSubtitleEditor : UIViewController
 @property (nonatomic, weak) YTPlayerViewController *player;
+@property (nonatomic, copy) NSString *videoID;
 @property (nonatomic, strong) UITextView *textView;
 @property (nonatomic, strong) UILabel *statusLabel;
 @end
@@ -606,6 +607,7 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
         [self.textView.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor]
     ]];
     NSString *videoID = self.player.currentVideoID;
+    self.videoID = videoID;
     __weak typeof(self) weakSelf = self;
     [[TDManager shared] fetchCaptionsForVideo:videoID completion:^(NSArray<NSDictionary *> *cues, NSError *error) {
         if (!weakSelf || ![weakSelf.player.currentVideoID isEqualToString:videoID]) return;
@@ -643,9 +645,10 @@ static NSString *TDSRTTime(NSTimeInterval seconds) {
 }
 - (void)save {
     if (!self.textView.editable) return;
+    if (![self.player.currentVideoID isEqualToString:self.videoID]) { self.statusLabel.text = @"Video đã thay đổi. Mở lại trình chỉnh sửa để tránh lưu nhầm."; return; }
     NSString *srt = self.textView.text;
     if (![self validateSRT:srt]) { self.statusLabel.text = @"SRT không hợp lệ: kiểm tra số thứ tự, thời gian và nội dung."; return; }
-    NSString *videoID = self.player.currentVideoID;
+    NSString *videoID = self.videoID;
     self.navigationItem.rightBarButtonItem.enabled = NO;
     self.statusLabel.text = @"Đang lưu…";
     [[TDManager shared] saveSubtitle:srt videoID:videoID completion:^(NSError *error) {
